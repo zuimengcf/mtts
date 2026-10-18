@@ -1,5 +1,7 @@
 package com.mtts.app.ui
 
+import android.content.Intent
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -217,6 +219,15 @@ private fun AboutContent() {
             Text(ctx.getString(R.string.about_desc),
                  style = MaterialTheme.typography.bodySmall,
                  color = MaterialTheme.colorScheme.secondary)
+            Spacer(Modifier.padding(8.dp))
+            val ghUrl = ctx.getString(R.string.about_github_url)
+            Text(
+                ctx.getString(R.string.about_github),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier
+                    .clickable { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(ghUrl))) }
+            )
         }
     }
 }

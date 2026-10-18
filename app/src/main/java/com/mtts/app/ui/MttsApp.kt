@@ -127,7 +127,8 @@ fun MttsApp(vm: MainViewModel = viewModel()) {
     val scope = rememberCoroutineScope()
     val ctx = LocalContext.current
     // 引擎列表版本号：语音包导入/删除后递增，驱动 grouped 重新求值
-    vm.enginesVersion.collectAsState()
+    // 必须实际读取该 State，否则 enginesVersion 变化不会触发重组，侧边栏无法及时刷新新导入的引擎
+    val enginesVersion by vm.enginesVersion.collectAsState()
     val grouped = vm.groupedEngines
 
     // 安卓返回键处理

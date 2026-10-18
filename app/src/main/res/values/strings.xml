@@ -102,6 +102,8 @@
     <!-- ===== 关于 ===== -->
     <string name="about_version">版本 %1$s</string>
     <string name="about_desc">基于 MultiTTS 引擎复用项目，自研引擎层 + 各厂商官方 SDK 离线合成。</string>
+    <string name="about_github">GitHub 项目</string>
+    <string name="about_github_url">https://github.com/zuimengcf/mtts</string>
 
     <!-- ===== 引擎设置 ===== -->
     <string name="registered_engines">已注册引擎</string>

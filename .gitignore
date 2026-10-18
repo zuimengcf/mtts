@@ -1,0 +1,22 @@
+# Gradle / Android 构建产物
+.gradle/
+.kotlin/
+build/
+*/build/
+local.properties
+*.apk
+*.aab
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# 本地备份/参考文件
+*.bak
+*.ref
+ref/
+reference_tts_engine.xml
+
+# OS
+.DS_Store

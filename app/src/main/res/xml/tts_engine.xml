@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 系统级 TTS 引擎声明：
+     声明本应用提供 Android 全局语音合成服务，可被系统设置选为默认 TTS 引擎。
+     settingsActivity 指向 mtts 主界面（用户可在此管理音色/导入语音包）。 -->
+<tts-engine xmlns:android="http://schemas.android.com/apk/res/android"
+    android:settingsActivity="com.mtts.app.ui.MainActivity" />

@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ===== 应用基础 ===== -->
+    <string name="app_name">mtts</string>
+    <string name="app_tagline">多引擎语音合成</string>
+
+    <!-- ===== 底部导航 ===== -->
+    <string name="tab_tts">TTS</string>
+    <string name="tab_dialog">对话</string>
+    <string name="tab_settings">设置</string>
+
+    <!-- ===== 通用动作 ===== -->
+    <string name="action_back">返回</string>
+    <string name="action_save">保存</string>
+    <string name="action_cancel">取消</string>
+    <string name="action_play">播放</string>
+    <string name="action_stop">停止</string>
+    <string name="action_preview">试听</string>
+    <string name="action_setting">设置</string>
+    <string name="action_delete">删除</string>
+    <string name="action_restore_default">恢复默认</string>
+    <string name="cd_menu">菜单</string>
+    <string name="saved">已保存</string>
+
+    <!-- ===== 引擎状态 / 类别 ===== -->
+    <string name="engine_status_ready">已就绪</string>
+    <string name="engine_status_needs_cookie">需Cookie</string>
+    <string name="engine_status_needs_config">需配置</string>
+    <string name="engine_status_stale">不可用</string>
+    <string name="engine_cat_online">在线引擎</string>
+    <string name="engine_cat_rule">规则引擎</string>
+    <string name="engine_cat_offline">离线语音包</string>
+
+    <!-- ===== TTS 主界面 ===== -->
+    <string name="text_input_title">输入文本</string>
+    <string name="text_input_label">输入要合成的文本</string>
+    <string name="text_input_placeholder">你好，世界…</string>
+    <string name="action_compact_text">收起</string>
+    <string name="action_expand_text">展开</string>
+    <string name="loading_voices">加载语音中…</string>
+    <string name="action_test_text">内置测试</string>
+    <string name="action_synthesize">合成语音</string>
+    <string name="action_synthesizing">合成中…</string>
+    <string name="msg_audio_ready">音频已就绪（%1$d KB）</string>
+    <string name="title_choose_voice">选择音色</string>
+    <string name="msg_no_voices">暂无音色（请导入语音包）</string>
+
+    <!-- ===== 音色参数对话框 ===== -->
+    <string name="voice_params_title">音色参数 · %1$s</string>
+    <string name="param_speed">语速</string>
+    <string name="param_volume">音量</string>
+    <string name="param_pitch">音高</string>
+
+    <!-- ===== 多引擎对话 ===== -->
+    <string name="dialog_title">多引擎对话</string>
+    <string name="roles">角色</string>
+    <string name="action_add_role">添加角色</string>
+    <string name="dialog_script_label">对话脚本（每行 角色标签: 台词）</string>
+    <string name="dialog_script_placeholder">角色1: 你好\n角色2：吃了吗\n角色1: 没有\n角色2: 快吃啊</string>
+    <string name="action_play_dialog">播放对话</string>
+    <string name="msg_synthesizing">正在合成…</string>
+    <string name="msg_playing_line">正在播放第 %1$d 句…</string>
+    <string name="cd_delete_role">删除角色</string>
+    <string name="select_voice">选择音色</string>
+    <string name="dialog_input_hint">输入台词…（点击左侧头像切换发言人）</string>
+    <string name="action_send">发送</string>
+    <string name="dialog_muted">已禁言</string>
+    <string name="dialog_mute">禁言</string>
+    <string name="dialog_unmute">取消禁言</string>
+    <string name="dialog_kick">移出群聊</string>
+    <string name="dialog_edit_speaker">修改发言人</string>
+    <string name="dialog_group_members">群成员</string>
+    <string name="dialog_add_member">添加群员</string>
+    <string name="global_params_title">全局合成参数</string>
+    <string name="global_params_desc">未单独配置的音色使用此全局值（语速 50 / 音量 50 / 语调 25 为基准）</string>
+    <string name="global_params_reset">恢复默认</string>
+    <string name="global_params_hint">全局参数（无单独配置时生效）</string>
+
+    <!-- ===== 设置项名称 ===== -->
+    <string name="set_about">关于</string>
+    <string name="set_about_desc">版本 / 项目信息</string>
+    <string name="set_engines">引擎设置</string>
+    <string name="set_engines_desc">管理已注册的 TTS 引擎</string>
+    <string name="set_voice_packs">语音包</string>
+    <string name="set_voice_packs_desc">离线语音包资源管理</string>
+    <string name="set_test_text">测试文本</string>
+    <string name="set_test_text_desc">修改内置测试的默认文本</string>
+    <string name="set_logs">日志</string>
+    <string name="set_logs_desc">查看运行日志</string>
+    <string name="set_http_server">HTTP 网关</string>
+    <string name="set_http_server_desc">端口号 / 开关，供外部调用本地引擎</string>
+    <string name="set_preprocess">文本预处理</string>
+    <string name="set_preprocess_desc">文字替换 / 多音字 / 对话识别</string>
+    <string name="action_exit_app">退出应用</string>
+    <string name="action_exit_app_hint">完全退出：停止常驻保活服务、HTTP 网关并结束进程（通知即消失）</string>
+    <string name="keep_alive_title">常驻服务</string>
+    <string name="keep_alive_desc">开启后保留常驻前台通知，后台也能持续提供服务；关闭后不再常驻</string>
+    <string name="keep_alive_enabled_hint">已开启常驻服务</string>
+    <string name="keep_alive_disabled_hint">常驻服务已关闭，退出后不会被系统再次拉起</string>
+    <string name="settings_title">设置</string>
+
+    <!-- ===== 关于 ===== -->
+    <string name="about_version">版本 %1$s</string>
+    <string name="about_desc">基于 MultiTTS 引擎复用项目，自研引擎层 + 各厂商官方 SDK 离线合成。</string>
+
+    <!-- ===== 引擎设置 ===== -->
+    <string name="registered_engines">已注册引擎</string>
+    <string name="engine_code_cat">code: %1$s · %2$s</string>
+
+    <!-- ===== 语音包 ===== -->
+    <string name="voice_packs_title">语音包 / 资源</string>
+    <string name="voice_packs_desc_title">导入语音包</string>
+    <string name="voice_packs_desc">点击下方"导入语音包"按钮，从文件管理器选择一个包含语音资源的 zip 压缩包（如 .onnx 模型 / 词典等）。导入后会自动解压到应用私有目录，并在"已导入语音包"列表中显示。</string>
+    <string name="action_import_voice">导入语音包 (zip)</string>
+    <string name="action_importing">导入中…</string>
+    <string name="msg_import_done">导入完成：%1$d 个文件</string>
+    <string name="msg_import_fail">导入失败：%1$s</string>
+    <string name="imported_packs">已导入语音包</string>
+    <string name="no_packs">暂无已导入语音包</string>
+    <string name="no_packs_hint">点击上方"导入语音包"选择一个 zip 压缩包。</string>
+    <string name="pack_files">%1$d 文件 · %2$s MB</string>
+    <string name="cd_delete_pack">删除 %1$s</string>
+    <string name="msg_pack_deleted">已删除 %1$s</string>
+    <string name="msg_pack_delete_fail">删除失败</string>
+
+    <!-- ===== 测试文本设置 ===== -->
+    <string name="test_text_title">测试文本</string>
+    <string name="test_text_desc">此文本用于主界面"内置测试"按钮（含音色试听）。修改后保存，下次使用该文本合成。</string>
+    <string name="test_text_field_label">测试文本内容</string>
+    <string name="test_text_default">你好，这是 mtts 内置的微软嵌入式离线语音测试。流式播放已经开始，你应该能听到这段声音。</string>
+
+    <!-- ===== 日志 ===== -->
+    <string name="logs_title">运行日志</string>
+    <string name="logs_desc">实时显示 TTS 合成日志（输入文本与输出结果）。下方文本自动刷新，也可手动刷新或清空。</string>
+    <string name="logs_auto_refresh">自动刷新中（2 秒）</string>
+    <string name="logs_auto_off">自动刷新已暂停</string>
+    <string name="action_refresh">刷新</string>
+    <string name="action_clear_log">清空</string>
+    <string name="action_toggle_auto">自动</string>
+    <string name="logs_empty">暂无日志。调用一次 TTS（如"内置测试"或外部 App 朗读）后，这里会显示合成记录。</string>
+    <string name="logs_file_hint">文件：{filesDir}/logs/mtts-yyyyMMdd.log</string>
+
+    <!-- ===== 错误 / 提示 ===== -->
+    <string name="err_need_input">请输入文本</string>
+    <string name="err_load_failed">加载语音失败</string>
+    <string name="err_no_engine">无可用引擎</string>
+    <string name="err_no_audio">合成未产出音频</string>
+    <string name="err_synth_failed">合成失败</string>
+    <string name="err_play_failed">播放失败</string>
+    <string name="err_preview_failed">试听失败</string>
+    <string name="dialog_need_input">请输入对话内容</string>
+    <string name="dialog_need_roles">请先添加角色</string>
+    <string name="dialog_bad_format">格式应为「角色标签: 台词」或「角色标签：台词」，如 角色1: 你好\n行: %1$s</string>
+    <string name="dialog_role_missing">未找到角色「%1$s」，可用: %2$s</string>
+    <string name="dialog_engine_missing">引擎 %1$s 未注册</string>
+    <string name="dialog_role_no_voice">角色 %1$s 未配置音色</string>
+    <string name="dialog_role_no_audio">角色 %1$s 合成无音频</string>
+    <string name="dialog_no_audio">对话未产出音频</string>
+    <string name="dialog_play_failed">对话播放失败</string>
+    <string name="text_demo">你好，世界…</string>
+</resources>

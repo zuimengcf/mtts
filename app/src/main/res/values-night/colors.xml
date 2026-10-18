@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 夜间背景：深墨紫蓝 -->
+    <color name="ic_launcher_background">#151A2E</color>
+    <color name="splash_background">#151A2E</color>
+</resources>

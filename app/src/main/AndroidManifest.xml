@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 系统级 TTS 引擎：媒体播放前台服务（Android 13+ 需该类型前台服务通知） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 声明本应用会调用系统 TTS 服务查询（供系统识别它是可用的 TTS 引擎） -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".MttsApplication"
+        android:label="mtts"
+        android:icon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Mtts"
+        android:usesCleartextTraffic="true">
+        <activity
+            android:name="com.mtts.app.ui.MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Mtts.Starting">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 系统 TTS 调用链路诊断入口（仅调试用）：以标准 App 方式调用系统 TextToSpeech -->
+        <activity
+            android:name="com.mtts.app.ui.TtsProbeActivity"
+            android:exported="true" />
+
+
+        <!-- 系统级 TTS 输出服务：任何 App 把默认 TTS 引擎切到 "mtts" 即可离线调用微软音色 -->
+        <service
+            android:name="com.mtts.app.service.TtsService"
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <action android:name="android.intent.action.TTS_SERVICE" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <meta-data
+                android:name="android.speech.tts"
+                android:resource="@xml/tts_engine" />
+        </service>
+        <!-- 保活前台服务（dataSync）：常驻进程，保证本地 HTTP 网关与离线引擎持续在线 -->
+        <service
+            android:name="com.mtts.app.service.KeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+    </application>
+</manifest>

@@ -24,13 +24,15 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Restore signing keystore from secrets
+      - name: Restore signing keystores and lineage from secrets
         run: |
           mkdir -p android/keystore
           echo "${{ secrets.MTTS_KEYSTORE_BASE64 }}" | base64 -d > android/keystore/zuimeng.jks
-          ls -l android/keystore/zuimeng.jks
+          echo "${{ secrets.MTTS_OLD_KEYSTORE_BASE64 }}" | base64 -d > android/keystore/zuimeng-old.jks
+          echo "${{ secrets.MTTS_LINEAGE_BASE64 }}" | base64 -d > android/lineage.bin
+          ls -l android/keystore/zuimeng.jks android/keystore/zuimeng-old.jks android/lineage.bin
 
-      - name: Build release APK (signed)
+      - name: Build release APK
         run: |
           cd android
           export MTTS_STORE_FILE=../keystore/zuimeng.jks
@@ -39,15 +41,38 @@ jobs:
           export MTTS_KEY_PASSWORD="${{ secrets.MTTS_KEY_PASSWORD }}"
           gradle :app:assembleRelease --no-daemon
 
+      - name: Rotate signing (v2 old + v3 new via lineage)
+        run: |
+          cd android
+          export PATH=$PATH:$ANDROID_HOME/build-tools
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          SRC=app/build/outputs/apk/release/app-release.apk
+          OUT=app/build/outputs/apk/release/app-release-rotated.apk
+          "$APKSIGNER" sign \
+            --ks keystore/zuimeng-old.jks --ks-key-alias zuimeng \
+            --ks-pass pass:"${{ secrets.MTTS_OLD_STORE_PASSWORD }}" \
+            --key-pass pass:"${{ secrets.MTTS_OLD_KEY_PASSWORD }}" \
+            --lineage lineage.bin \
+            --next-signer \
+            --ks keystore/zuimeng.jks --ks-key-alias zuimeng \
+            --ks-pass pass:"${{ secrets.MTTS_STORE_PASSWORD }}" \
+            --key-pass pass:"${{ secrets.MTTS_KEY_PASSWORD }}" \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --v1-signing-enabled false \
+            --out "$OUT" "$SRC"
+          "$APKSIGNER" verify --verbose --print-certs "$OUT"
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: mtts-release-apk
-          path: android/app/build/outputs/apk/release/app-release.apk
+          path: android/app/build/outputs/apk/release/app-release-rotated.apk
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: android/app/build/outputs/apk/release/app-release.apk
+          files: android/app/build/outputs/apk/release/app-release-rotated.apk
           generate_release_notes: true

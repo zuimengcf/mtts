@@ -34,7 +34,7 @@ jobs:
 
       - name: Build release APK
         run: |
-          export MTTS_STORE_FILE=keystore/zuimeng.jks
+          export MTTS_STORE_FILE="$GITHUB_WORKSPACE/keystore/zuimeng.jks"
           export MTTS_STORE_PASSWORD="${{ secrets.MTTS_STORE_PASSWORD }}"
           export MTTS_KEY_ALIAS="${{ secrets.MTTS_KEY_ALIAS }}"
           export MTTS_KEY_PASSWORD="${{ secrets.MTTS_KEY_PASSWORD }}"

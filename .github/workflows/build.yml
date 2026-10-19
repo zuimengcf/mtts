@@ -26,16 +26,15 @@ jobs:
 
       - name: Restore signing keystores and lineage from secrets
         run: |
-          mkdir -p android/keystore
-          echo "${{ secrets.MTTS_KEYSTORE_BASE64 }}" | base64 -d > android/keystore/zuimeng.jks
-          echo "${{ secrets.MTTS_OLD_KEYSTORE_BASE64 }}" | base64 -d > android/keystore/zuimeng-old.jks
-          echo "${{ secrets.MTTS_LINEAGE_BASE64 }}" | base64 -d > android/lineage.bin
-          ls -l android/keystore/zuimeng.jks android/keystore/zuimeng-old.jks android/lineage.bin
+          mkdir -p keystore
+          echo "${{ secrets.MTTS_KEYSTORE_BASE64 }}" | base64 -d > keystore/zuimeng.jks
+          echo "${{ secrets.MTTS_OLD_KEYSTORE_BASE64 }}" | base64 -d > keystore/zuimeng-old.jks
+          echo "${{ secrets.MTTS_LINEAGE_BASE64 }}" | base64 -d > lineage.bin
+          ls -l keystore/zuimeng.jks keystore/zuimeng-old.jks lineage.bin
 
       - name: Build release APK
         run: |
-          cd android
-          export MTTS_STORE_FILE=../keystore/zuimeng.jks
+          export MTTS_STORE_FILE=keystore/zuimeng.jks
           export MTTS_STORE_PASSWORD="${{ secrets.MTTS_STORE_PASSWORD }}"
           export MTTS_KEY_ALIAS="${{ secrets.MTTS_KEY_ALIAS }}"
           export MTTS_KEY_PASSWORD="${{ secrets.MTTS_KEY_PASSWORD }}"
@@ -43,7 +42,6 @@ jobs:
 
       - name: Rotate signing (v2 old + v3 new via lineage)
         run: |
-          cd android
           export PATH=$PATH:$ANDROID_HOME/build-tools
           BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
           APKSIGNER="$BUILD_TOOLS/apksigner"
@@ -68,11 +66,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mtts-release-apk
-          path: android/app/build/outputs/apk/release/app-release-rotated.apk
+          path: app/build/outputs/apk/release/app-release-rotated.apk
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: android/app/build/outputs/apk/release/app-release-rotated.apk
+          files: app/build/outputs/apk/release/app-release-rotated.apk
           generate_release_notes: true

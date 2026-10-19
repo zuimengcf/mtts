@@ -490,8 +490,8 @@ object AppPrefs {
 
     private const val KEY_KEEP_ALIVE = "keep_alive_enabled"
 
-    /** 是否启用常驻保活服务（true=常驻通知；false=已退出/停用） */
-    fun isKeepAliveEnabled(): Boolean = getBoolean(KEY_KEEP_ALIVE, true)
+    /** 是否启用常驻保活服务（true=常驻通知；false=已退出/停用；默认关） */
+    fun isKeepAliveEnabled(): Boolean = getBoolean(KEY_KEEP_ALIVE, false)
 
     fun setKeepAliveEnabled(on: Boolean) = putBoolean(KEY_KEEP_ALIVE, on)
 
@@ -499,8 +499,8 @@ object AppPrefs {
 
     private const val KEY_SHERPA_WARMUP = "sherpa_warmup_enabled"
 
-    /** 是否在启动时预热 sherpa 模型（true=后台预加载所有模型，首次合成不卡；false=首次合成时才加载） */
-    fun isSherpaWarmupEnabled(): Boolean = getBoolean(KEY_SHERPA_WARMUP, true)
+    /** 是否在启动时预热 sherpa 模型（true=后台预加载所有模型，首次合成不卡；false=首次合成时才加载；默认关） */
+    fun isSherpaWarmupEnabled(): Boolean = getBoolean(KEY_SHERPA_WARMUP, false)
 
     fun setSherpaWarmupEnabled(on: Boolean) = putBoolean(KEY_SHERPA_WARMUP, on)
 
@@ -510,20 +510,45 @@ object AppPrefs {
     private const val KEY_HTTP_PORT = "http_gateway_port"
     private const val DEFAULT_HTTP_PORT = 8080
     private const val KEY_HTTP_TOKEN = "http_gateway_token"
-    private const val DEFAULT_HTTP_TOKEN = "mttsdev123"
+    private const val LEGACY_HTTP_TOKEN = "mttsdev123"
 
-    /** HTTP 网关是否启用（默认开） */
-    fun isHttpEnabled(): Boolean = getBoolean(KEY_HTTP_ENABLED, true)
+    /** HTTP 网关默认关闭；保留用户已显式保存的开关设置。 */
+    fun isHttpEnabled(): Boolean = getBoolean(KEY_HTTP_ENABLED, false)
     fun setHttpEnabled(on: Boolean) = putBoolean(KEY_HTTP_ENABLED, on)
 
     /** HTTP 端口（默认 8080；若被占用 LocalHttpServer 会自动回退到其后端口） */
     fun httpPort(): Int = getInt(KEY_HTTP_PORT, DEFAULT_HTTP_PORT).coerceIn(1024, 65535)
     fun setHttpPort(port: Int) = putInt(KEY_HTTP_PORT, port.coerceIn(1024, 65535))
 
-    /** HTTP 认证令牌（X-Auth-Token，默认 mttsdev123） */
-    fun httpToken(): String =
-        (getString(KEY_HTTP_TOKEN, "") ?: "").trim().ifBlank { DEFAULT_HTTP_TOKEN }
-    fun setHttpToken(token: String) = putString(KEY_HTTP_TOKEN, token.trim())
+    /** 首次使用或遇到旧默认令牌时，生成并保存安装实例独有的随机令牌。 */
+    @Synchronized
+    fun httpToken(): String {
+        val p = checkNotNull(prefs()) { "HTTP token storage is unavailable" }
+        val saved = p.getString(KEY_HTTP_TOKEN, "").orEmpty().trim()
+        if (saved.isNotEmpty() && saved != LEGACY_HTTP_TOKEN) return saved
+        val generated = newHttpToken()
+        check(p.edit().putString(KEY_HTTP_TOKEN, generated).commit()) {
+            "Failed to persist HTTP token"
+        }
+        return generated
+    }
+
+    /** 清空令牌或重新填写旧默认值时，改为生成新的随机令牌。 */
+    @Synchronized
+    fun setHttpToken(token: String) {
+        val p = checkNotNull(prefs()) { "HTTP token storage is unavailable" }
+        val trimmed = token.trim()
+        val value = if (trimmed.isEmpty() || trimmed == LEGACY_HTTP_TOKEN) newHttpToken() else trimmed
+        check(p.edit().putString(KEY_HTTP_TOKEN, value).commit()) {
+            "Failed to persist HTTP token"
+        }
+    }
+
+    private fun newHttpToken(): String {
+        val bytes = ByteArray(32)
+        java.security.SecureRandom().nextBytes(bytes)
+        return bytes.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    }
 
     /** 任意 HTTP 开关或端口被改后是否需要重启 HTTP 服务 */
     fun httpNeedsRestart(): Boolean = isHttpEnabled()

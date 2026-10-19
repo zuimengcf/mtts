@@ -20,3 +20,9 @@ reference_tts_engine.xml
 
 # OS
 .DS_Store
+
+# 签名文件（敏感，不入库）
+keystore/
+*.jks
+*.keystore
+keystore.properties

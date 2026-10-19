@@ -1,15 +1,20 @@
 package com.mtts.app.server
 
 import com.mtts.app.engine.EngineRegistry
+import com.mtts.app.engine.TtsEngine
+import com.mtts.app.engine.Voice
 import com.mtts.app.util.FileLog
 import com.mtts.app.util.MttsLog
 import kotlinx.coroutines.runBlocking
 import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
 import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
 
 /**
@@ -196,28 +201,30 @@ object LocalHttpServer {
         if (eng == null) { sendJson(socket, 404, mapOf("error" to "引擎 $engine 不存在")); return }
         try {
             val audio = runBlocking {
-                val v = voice.ifBlank { eng.listVoices().firstOrNull()?.shortName.orEmpty() }
-                // ★ 剥离停顿/音量/音调标记，避免 ⟨pause:ms⟩ 等被引擎当普通文字朗读（与 TtsService 一致）
+                val voices = eng.listVoices()
+                val v = voice.ifBlank { voices.firstOrNull()?.shortName.orEmpty() }
+                // ★ 剥离停顿/音量/音调标记，避免标记被引擎当普通文字朗读（与 TtsService 一致）
                 val clean = com.mtts.app.util.TextPreprocessor.stripAllMarkers(text)
-                eng.synthesize(clean, v, speed, volume, pitch)
+                val pcm = eng.synthesize(clean, v, speed, volume, pitch)
+                val sourceRate = sourceSampleRate(eng, voices, v)
+                com.mtts.app.util.PcmResampler.resample16BitMono(pcm, sourceRate, OUTPUT_SAMPLE_RATE)
             }
             if (audio.isEmpty()) { sendJson(socket, 500, mapOf("error" to "合成结果为空")); return }
-
+            val wav = pcmToWav(audio, OUTPUT_SAMPLE_RATE)
             val header = ("HTTP/1.1 200 OK\r\n" +
-                "Content-Type: audio/mpeg\r\n" +
-                "Content-Length: ${audio.size}\r\n" +
+                "Content-Type: audio/wav\r\n" +
+                "Content-Length: ${wav.size}\r\n" +
                 "Cache-Control: no-store\r\n" +
                 "Connection: close\r\n\r\n").toByteArray(StandardCharsets.UTF_8)
             val out: OutputStream = socket.getOutputStream()
             out.write(header)
-            out.write(audio)
+            out.write(wav)
             out.flush()
         } catch (e: Exception) {
             MttsLog.e("HttpServer", "synthesize failed [$engine]", e)
             sendJson(socket, 500, mapOf("error" to "合成失败: ${e.message}"))
         }
     }
-
     /**
      * 对话合成（模拟外部 TTS 请求）：
      * 整段小说文本 → DialogFeature.process 识别说话人/旁白分段 → 逐段合成 → 拼接为完整音频返回。
@@ -228,31 +235,28 @@ object LocalHttpServer {
         speed: Float, volume: Float, pitch: Float
     ) {
         try {
-            // 对话功能未启用时与普通 synthesize 等效
             val segs = com.mtts.app.util.DialogFeature.process(text, { ec ->
-                runBlocking {
-                    EngineRegistry.get(ec)?.listVoices() ?: emptyList()
-                }
+                runBlocking { EngineRegistry.get(ec)?.listVoices() ?: emptyList() }
             }, defaultEngine(), defaultVoice())
-            val segments = segs ?: listOf(com.mtts.app.util.DialogSeg(text, true, "", defaultEngine(), defaultVoice(), speed, volume, pitch))
-
-            // 逐段合成拼接
-            val out = java.io.ByteArrayOutputStream()
+            // DialogFeature 未启用时，外层请求参数只在下面合成调用处应用一次。
+            // 回退段必须保持中性，否则 speed/volume/pitch 会被重复乘/加。
+            val segments = segs ?: listOf(com.mtts.app.util.DialogSeg(text, true, "", defaultEngine(), defaultVoice()))
+            val out = ByteArrayOutputStream()
             val segMeta = ArrayList<Map<String, Any>>()
             for (seg in segments) {
                 if (seg.text.isBlank()) continue
-                val eng = EngineRegistry.get(seg.engineCode)
-                if (eng == null) continue
+                val eng = EngineRegistry.get(seg.engineCode) ?: continue
                 val clean = com.mtts.app.util.TextPreprocessor.stripAllMarkers(seg.text)
                 if (clean.isBlank()) continue
-                val segVoice = seg.voice.ifBlank {
-                    runBlocking { eng.listVoices().firstOrNull()?.shortName }.orEmpty()
-                }
+                val voices = runBlocking { eng.listVoices() }
+                val segVoice = seg.voice.ifBlank { voices.firstOrNull()?.shortName.orEmpty() }
                 val audio = runBlocking {
-                    eng.synthesize(clean, segVoice,
+                    val pcm = eng.synthesize(clean, segVoice,
                         (speed * seg.speed).coerceIn(0.25f, 4f),
                         (volume * seg.volume).coerceIn(0f, 2f),
                         (pitch + seg.pitch).coerceIn(-1f, 1f))
+                    val sourceRate = sourceSampleRate(eng, voices, segVoice)
+                    com.mtts.app.util.PcmResampler.resample16BitMono(pcm, sourceRate, OUTPUT_SAMPLE_RATE)
                 }
                 if (audio.isNotEmpty()) {
                     out.write(audio)
@@ -263,10 +267,9 @@ object LocalHttpServer {
                 }
             }
             if (out.size() == 0) { sendJson(socket, 500, mapOf("error" to "合成结果为空")); return }
-
-            val body = out.toByteArray()
+            val body = pcmToWav(out.toByteArray(), OUTPUT_SAMPLE_RATE)
             val header = ("HTTP/1.1 200 OK\r\n" +
-                "Content-Type: audio/mpeg\r\n" +
+                "Content-Type: audio/wav\r\n" +
                 "Content-Length: ${body.size}\r\n" +
                 "X-Dialog-Segments: ${segMeta.size}\r\n" +
                 "Cache-Control: no-store\r\n" +
@@ -279,6 +282,49 @@ object LocalHttpServer {
             MttsLog.e("HttpServer", "synthesizeDialog failed", e)
             sendJson(socket, 500, mapOf("error" to "对话合成失败: ${e.message}"))
         }
+    }
+    private const val OUTPUT_SAMPLE_RATE = 24000
+
+    /**
+     * 引擎 PCM 的真实输入采样率约定，与 TtsService.engineSampleRate 对齐。
+     * 微软和 sherpa 的合成层已经统一输出 24 kHz，不能被音色配置中的原始
+     * sampleRate 覆盖；搜狗固定输出 16 kHz。其它引擎优先匹配当前音色，
+     * 避免同一引擎内的 16 kHz / 24 kHz 音色互相混淆。
+     */
+    private fun sourceSampleRate(engine: TtsEngine?, voices: List<Voice>, voice: String): Int {
+        if (engine == null) return OUTPUT_SAMPLE_RATE
+        val selectedRate = voices.firstOrNull { it.shortName == voice }?.sampleRate?.takeIf { it > 0 }
+        return when (engine.code.lowercase()) {
+            "sougou" -> 16000
+            "microsoft", "sherpa" -> OUTPUT_SAMPLE_RATE
+            "bdetts" -> selectedRate ?: 16000
+            else -> selectedRate ?: voices.firstOrNull()?.sampleRate?.takeIf { it > 0 } ?: OUTPUT_SAMPLE_RATE
+        }
+    }
+
+    /** 将 16-bit little-endian mono PCM 包装为标准 PCM WAV。 */
+    private fun pcmToWav(pcm: ByteArray, sampleRate: Int): ByteArray {
+        // 16-bit PCM 必须按完整 sample 对齐；同时钳制无效采样率，避免生成非法 WAV。
+        val dataSize = pcm.size and -2
+        val safeRate = sampleRate.takeIf { it > 0 } ?: OUTPUT_SAMPLE_RATE
+        val wav = ByteArrayOutputStream(44 + dataSize)
+        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+        header.put("RIFF".toByteArray(StandardCharsets.US_ASCII))
+        header.putInt(36 + dataSize)
+        header.put("WAVE".toByteArray(StandardCharsets.US_ASCII))
+        header.put("fmt ".toByteArray(StandardCharsets.US_ASCII))
+        header.putInt(16)
+        header.putShort(1.toShort())
+        header.putShort(1.toShort())
+        header.putInt(safeRate)
+        header.putInt(safeRate * 2)
+        header.putShort(2.toShort())
+        header.putShort(16.toShort())
+        header.put("data".toByteArray(StandardCharsets.US_ASCII))
+        header.putInt(dataSize)
+        wav.write(header.array())
+        if (dataSize > 0) wav.write(pcm, 0, dataSize)
+        return wav.toByteArray()
     }
 
     /** 当前默认引擎（与 TtsService 一致：上次选择的引擎或 microsoft 兜底） */

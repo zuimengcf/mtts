@@ -186,7 +186,7 @@ SettingsItem.PREPROCESS -> {
                         }
                     }
                 }
-                SettingsItem.SETTINGS_IO -> SettingsIoContent()
+                SettingsItem.SETTINGS_IO -> SettingsIoContent(vm)
                 SettingsItem.DIALOG_FEATURE -> {
                     // 对话功能：默认显示主页；点功能卡片后显示对应二级页
                     if (uiState.dialogFeaturePage == null) {
@@ -772,7 +772,7 @@ private fun HttpServerContent(vm: MainViewModel) {
                     singleLine = true
                 )
                 Spacer(Modifier.height(4.dp))
-                Text("请求时需携带此令牌（如默认 mttsdev123），改后重启生效。",
+                Text("请求时需携带此令牌。首次使用自动生成；清空并保存可重新生成。启用后局域网可访问，请勿泄露令牌。",
                      style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
                 Spacer(Modifier.height(12.dp))
                 Row(Modifier.fillMaxWidth()) {
@@ -783,6 +783,7 @@ private fun HttpServerContent(vm: MainViewModel) {
                             portText = p.toString()
                             com.mtts.app.util.AppPrefs.setHttpPort(p)
                             com.mtts.app.util.AppPrefs.setHttpToken(tokenText)
+                            tokenText = com.mtts.app.util.AppPrefs.httpToken()
                             com.mtts.app.util.AppPrefs.setHttpEnabled(enabled)
                             if (enabled) {
                                 try { com.mtts.app.server.LocalHttpServer.stop() } catch (_: Throwable) {}
@@ -849,7 +850,7 @@ private fun settingsItemIcon(item: SettingsItem): ImageVector = when (item) {
 
 /** 全局设置导入导出：除语音包外的全部 SharedPreferences + 替换规则 */
 @Composable
-fun SettingsIoContent() {
+fun SettingsIoContent(vm: MainViewModel) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var msg by remember { mutableStateOf<String?>(null) }
@@ -885,8 +886,10 @@ fun SettingsIoContent() {
                 val result = withContext(Dispatchers.IO) {
                     com.mtts.app.util.SettingsBackup.importFrom(uri)
                 }
-                result.onSuccess { m -> msg = m }
-                      .onFailure { e -> err = "导入失败：${e.message}" }
+                result.onSuccess { m ->
+                          msg = m
+                          vm.reloadAfterSettingsImport()
+                      }.onFailure { e -> err = "导入失败：${e.message}" }
             } catch (e: Exception) {
                 err = "导入失败：${e.message}"
             }

@@ -88,6 +88,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -127,9 +128,10 @@ fun MttsApp(vm: MainViewModel = viewModel()) {
     val scope = rememberCoroutineScope()
     val ctx = LocalContext.current
     // 引擎列表版本号：语音包导入/删除后递增，驱动 grouped 重新求值
-    // 必须实际读取该 State，否则 enginesVersion 变化不会触发重组，侧边栏无法及时刷新新导入的引擎
+    // 委托属性必须被使用才会读取 State.value；仅 collectAsState 不会订阅重组。
     val enginesVersion by vm.enginesVersion.collectAsState()
-    val grouped = vm.groupedEngines
+    val settingsRevision by vm.settingsRevision.collectAsState()
+    val grouped = remember(vm, enginesVersion) { vm.groupedEngines }
 
     // 安卓返回键处理
     BackHandler {
@@ -182,7 +184,7 @@ fun MttsApp(vm: MainViewModel = viewModel()) {
                 }
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                 // 全局合成参数（可折叠，离线包/引擎列表上方）
-                GlobalParamsDrawerSection()
+                key(settingsRevision) { GlobalParamsDrawerSection() }
                 // 引擎分组列表
                 LazyColumn(Modifier.weight(1f).padding(vertical = 8.dp)) {
                     grouped.forEach { (category, engines) ->
@@ -211,7 +213,7 @@ fun MttsApp(vm: MainViewModel = viewModel()) {
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                 Column(Modifier.fillMaxWidth().padding(12.dp)) {
                     // 常驻服务开关
-                    var keepAlive by remember { mutableStateOf(com.mtts.app.util.AppPrefs.isKeepAliveEnabled()) }
+                    var keepAlive by remember(settingsRevision) { mutableStateOf(com.mtts.app.util.AppPrefs.isKeepAliveEnabled()) }
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically
@@ -237,7 +239,7 @@ fun MttsApp(vm: MainViewModel = viewModel()) {
                         )
                     }
                     // 使用外部朗读参数（是否接受外部 App 传入的语速/音调）
-                    var externalParams by remember { mutableStateOf(com.mtts.app.util.AppPrefs.isExternalParamsEnabled()) }
+                    var externalParams by remember(settingsRevision) { mutableStateOf(com.mtts.app.util.AppPrefs.isExternalParamsEnabled()) }
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically
@@ -304,9 +306,21 @@ fun MttsApp(vm: MainViewModel = viewModel()) {
                     .padding(bottom = innerPadding.calculateBottomPadding())
             ) {
                 when (uiState.bottomTab) {
-                    BottomTab.TTS -> TtsContent(vm, uiState, drawerState, scope)
-                    BottomTab.DIALOG -> DialogContent(vm)
-                    BottomTab.SETTINGS -> SettingsScreen(vm, uiState.settingsDetail)
+                    // Recreate remembered controls after import. Keep the IO page
+                    // itself unkeyed so its success message is not discarded.
+                    BottomTab.TTS -> key(settingsRevision) {
+                        TtsContent(vm, uiState, drawerState, scope)
+                    }
+                    BottomTab.DIALOG -> key(settingsRevision) {
+                        DialogContent(vm)
+                    }
+                    BottomTab.SETTINGS -> if (uiState.settingsDetail == SettingsItem.SETTINGS_IO) {
+                        SettingsScreen(vm, uiState.settingsDetail)
+                    } else {
+                        key(settingsRevision) {
+                            SettingsScreen(vm, uiState.settingsDetail)
+                        }
+                    }
                 }
             }
         }
@@ -1196,7 +1210,7 @@ private fun VoiceDropdown(
 @Composable
 private fun DialogContent(vm: MainViewModel) {
     val dialog by vm.dialog.collectAsState()
-    val engines = vm.allEngines
+    val engines by EngineRegistry.registeredEngines.collectAsState()
     val ctx = LocalContext.current
     var input by remember { mutableStateOf("") }
     val listState = rememberLazyListState()

@@ -2,7 +2,15 @@ package com.mtts.app.util
 
 import android.content.Context
 import android.net.Uri
+import com.google.gson.Gson
+import com.google.gson.JsonElement
+import com.google.gson.JsonNull
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import com.google.gson.Strictness
+import com.google.gson.stream.JsonReader
 import java.io.File
+import java.io.StringReader
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -45,38 +53,47 @@ object SettingsBackup {
     private fun buildBackupText(): String {
         val ctx = com.mtts.app.MttsApplication.ctx()
         val p = ctx?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val all: Map<String, Any?> = p?.all ?: emptyMap()
-        val replaces = TextPreprocessor.loadReplacesFromVoice()
+        val root = JsonObject()
+        root.addProperty("version", 1)
+        root.addProperty("exportedAt", System.currentTimeMillis().toString())
 
-        val sb = StringBuilder(8192)
-        sb.append("{\n")
-        sb.append("  \"version\": 1,\n")
-        sb.append("  \"exportedAt\": ").append(jsonStr(System.currentTimeMillis().toString())).append(",\n")
-        sb.append("  \"prefs\": {\n")
-        val keys = all.keys.toList().sorted()
-        keys.forEachIndexed { i, k ->
-            sb.append("    ").append(jsonStr(k)).append(": ").append(prefsValueJson(all[k]))
-            if (i < keys.size - 1) sb.append(",")
-            sb.append("\n")
+        val prefsJson = JsonObject()
+        val all: Map<String, Any?> = p?.all ?: emptyMap()
+        all.keys.toList().sorted().forEach { key ->
+            val value = JsonObject()
+            when (val v = all[key]) {
+                null -> {
+                    value.addProperty("type", "string")
+                    value.add("value", JsonNull.INSTANCE)
+                }
+                is String -> { value.addProperty("type", "string"); value.addProperty("value", v) }
+                is Int -> { value.addProperty("type", "int"); value.addProperty("value", v) }
+                is Long -> { value.addProperty("type", "long"); value.addProperty("value", v) }
+                is Float -> { value.addProperty("type", "float"); value.addProperty("value", v) }
+                is Double -> { value.addProperty("type", "float"); value.addProperty("value", v) }
+                is Boolean -> { value.addProperty("type", "boolean"); value.addProperty("value", v) }
+                is FloatArray -> { value.addProperty("type", "string"); value.addProperty("value", java.util.Arrays.toString(v)) }
+                is Set<*> -> { value.addProperty("type", "string"); value.addProperty("value", v.toString()) }
+                else -> { value.addProperty("type", "string"); value.addProperty("value", v.toString()) }
+            }
+            prefsJson.add(key, value)
         }
-        sb.append("  },\n")
-        sb.append("  \"replaces\": [\n")
-        replaces.forEachIndexed { i, r ->
-            sb.append("    {")
-            sb.append("\"name\":").append(jsonStr(r.name)).append(",")
-            sb.append("\"source\":").append(jsonStr(r.source)).append(",")
-            sb.append("\"target\":").append(jsonStr(r.target)).append(",")
-            sb.append("\"regex\":").append(r.regex).append(",")
-            sb.append("\"activate\":").append(r.activate).append(",")
-            sb.append("\"group\":").append(jsonStr(r.group)).append(",")
-            sb.append("\"pauseMs\":").append(r.pauseMs)
-            sb.append("}")
-            if (i < replaces.size - 1) sb.append(",")
-            sb.append("\n")
+        root.add("prefs", prefsJson)
+
+        val replacesJson = com.google.gson.JsonArray()
+        TextPreprocessor.loadReplacesFromVoice().forEach { r ->
+            val item = JsonObject()
+            item.addProperty("name", r.name)
+            item.addProperty("source", r.source)
+            item.addProperty("target", r.target)
+            item.addProperty("regex", r.regex)
+            item.addProperty("activate", r.activate)
+            item.addProperty("group", r.group)
+            item.addProperty("pauseMs", r.pauseMs)
+            replacesJson.add(item)
         }
-        sb.append("  ]\n")
-        sb.append("}\n")
-        return sb.toString()
+        root.add("replaces", replacesJson)
+        return Gson().toJson(root) + "\n"
     }
 
     // ============== 全局设置：导入 ==============
@@ -93,37 +110,35 @@ object SettingsBackup {
 
     fun importFromText(text: String): Result<String> {
         val ctx = com.mtts.app.MttsApplication.ctx() ?: return fail("上下文不可用")
+        val parsed = try { parseBackup(text) } catch (e: Exception) {
+            return fail("导入失败: ${e.message ?: "JSON格式无效"}")
+        }
         val p = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val editor = p.edit()
-
-        val prefs = parsePrefsSection(text)
-        prefs.entries.forEach { e ->
-            val k: String = e.key
-            val type: String = e.value.first
-            val value: String? = e.value.second
-            try {
-                when (type) {
-                    "string"  -> editor.putString(k, value ?: "")
-                    "int"     -> editor.putInt(k, value?.toIntOrNull() ?: 0)
-                    "long"    -> editor.putLong(k, value?.toLongOrNull() ?: 0L)
-                    "float"   -> editor.putFloat(k, value?.toFloatOrNull() ?: 0f)
-                    "boolean" -> editor.putBoolean(k, value == "true")
-                    else -> {}
-                }
-            } catch (_: Exception) {}
+        parsed.prefs.forEach { (key, typed) ->
+            when (typed.first) {
+                "string" -> editor.putString(key, typed.second as String)
+                "int" -> editor.putInt(key, typed.second as Int)
+                "long" -> editor.putLong(key, typed.second as Long)
+                "float" -> editor.putFloat(key, typed.second as Float)
+                "boolean" -> editor.putBoolean(key, typed.second as Boolean)
+            }
         }
-        editor.apply()
-
-        val replaces = parseReplacesSection(text)
-        if (replaces.isNotEmpty()) {
+        // Parsing and validation are complete before either destination is written.
+        if (!editor.commit()) return fail("设置写入失败")
+        if (parsed.replaces.isNotEmpty()) {
             val old = TextPreprocessor.loadReplacesFromVoice()
             val merged = old.filterNot { existing ->
-                replaces.any { it.source == existing.source && it.regex == existing.regex }
-            } + replaces
-            TextPreprocessor.saveReplacesToVoice(merged)
-            return ok("已导入 ${prefs.size} 项设置 + ${replaces.size} 条规则（合并去重）")
+                parsed.replaces.any { it.source == existing.source && it.regex == existing.regex }
+            } + parsed.replaces
+            try {
+                TextPreprocessor.saveReplacesToVoice(merged)
+            } catch (e: Exception) {
+                return fail("规则写入失败: ${e.message}")
+            }
+            return ok("已导入 ${parsed.prefs.size} 项设置 + ${parsed.replaces.size} 条规则（合并去重）")
         }
-        return ok("已导入 ${prefs.size} 项设置")
+        return ok("已导入 ${parsed.prefs.size} 项设置")
     }
 
     // ============== 语音包导出（每个 pack 单独 zip） ==============
@@ -177,196 +192,94 @@ object SettingsBackup {
     private fun ok(msg: String): Result<String> = Result.success(msg)
     private fun fail(msg: String): Result<String> = Result.failure(RuntimeException(msg))
 
-    private fun jsonStr(s: String): String {
-        val sb = StringBuilder(s.length + 2).append('"')
-        for (c in s) {
-            when (c) {
-                '\\' -> sb.append("\\\\")
-                '"' -> sb.append("\\\"")
-                '\n' -> sb.append("\\n")
-                '\r' -> sb.append("\\r")
-                '\t' -> sb.append("\\t")
-                else -> {
-                    if (c.code < 0x20) sb.append(String.format("\\u%04x", c.code))
-                    else sb.append(c)
-                }
-            }
+    private data class ParsedBackup(
+        val prefs: Map<String, Pair<String, Any>>,
+        val replaces: List<TextPreprocessor.ReplaceRule>
+    )
+
+    private fun parseBackup(text: String): ParsedBackup {
+        val reader = JsonReader(StringReader(text))
+        reader.strictness = Strictness.STRICT
+        val root = JsonParser.parseReader(reader)
+        if (reader.peek() != com.google.gson.stream.JsonToken.END_DOCUMENT) {
+            throw IllegalArgumentException("JSON末尾存在多余内容")
         }
-        return sb.append('"').toString()
-    }
-
-    private fun prefsValueJson(v: Any?): String = when (v) {
-        null -> "null"
-        is String -> "{ \"type\": \"string\", \"value\": " + jsonStr(v) + " }"
-        is Int -> "{ \"type\": \"int\", \"value\": " + v + " }"
-        is Long -> "{ \"type\": \"long\", \"value\": " + v + " }"
-        is Float -> "{ \"type\": \"float\", \"value\": " + v + " }"
-        is Double -> "{ \"type\": \"float\", \"value\": " + v + " }"
-        is Boolean -> "{ \"type\": \"boolean\", \"value\": " + v + " }"
-        is FloatArray -> "{ \"type\": \"string\", \"value\": " + jsonStr(java.util.Arrays.toString(v)) + " }"
-        is Set<*> -> "{ \"type\": \"string\", \"value\": " + jsonStr(v.toString()) + " }"
-        else -> "{ \"type\": \"string\", \"value\": " + jsonStr(v.toString()) + " }"
-    }
-
-    private fun parsePrefsSection(text: String): Map<String, Pair<String, String?>> {
-        val out = HashMap<String, Pair<String, String?>>()
-        val marker = "\"prefs\""
-        val start = text.indexOf(marker)
-        if (start < 0) return out
-        val open = text.indexOf('{', start + marker.length)
-        if (open < 0) return out
-        var depth = 0
-        var end = -1
-        for (i in open until text.length) {
-            when (text[i]) {
-                '{' -> depth++
-                '}' -> { depth--; if (depth == 0) { end = i; break } }
-            }
+        if (!root.isJsonObject) throw IllegalArgumentException("根节点必须是对象")
+        val obj = root.asJsonObject
+        val version = obj.get("version")
+        if (version == null || !version.isJsonPrimitive || !version.asJsonPrimitive.isNumber ||
+            version.asJsonPrimitive.asString != "1") {
+            throw IllegalArgumentException("仅支持 version 1 备份")
         }
-        if (end < 0) return out
-        val section = text.substring(open + 1, end)
-        var i = 0
-        while (i < section.length) {
-            val q1 = section.indexOf('"', i)
-            if (q1 < 0) break
-            val q2 = section.indexOf('"', q1 + 1)
-            if (q2 < 0) break
-            val key = unescape(section.substring(q1 + 1, q2))
-            val brace = section.indexOf('{', q2)
-            if (brace < 0) break
-            var d2 = 0
-            var bEnd = -1
-            for (j in brace until section.length) {
-                when (section[j]) {
-                    '{' -> d2++
-                    '}' -> { d2--; if (d2 == 0) { bEnd = j; break } }
-                }
-            }
-            if (bEnd < 0) break
-            val obj = section.substring(brace, bEnd + 1)
-            val typeIdx = obj.indexOf("\"type\"")
-            val valIdx = obj.indexOf("\"value\"")
-            if (typeIdx >= 0 && valIdx >= 0) {
-                val (t, v) = extractTypedValue(obj, typeIdx, valIdx)
-                out[key] = t to v
-            }
-            i = bEnd + 1
+        val prefsElement = obj.get("prefs")
+        if (prefsElement == null || !prefsElement.isJsonObject) throw IllegalArgumentException("prefs必须是对象")
+        val prefs = LinkedHashMap<String, Pair<String, Any>>()
+        prefsElement.asJsonObject.entrySet().forEach { (key, element) ->
+            if (!element.isJsonObject) throw IllegalArgumentException("设置 $key 格式无效")
+            val typed = element.asJsonObject
+            val type = typed.get("type")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString
+                ?: throw IllegalArgumentException("设置 $key 缺少类型")
+            val value = typed.get("value")
+            prefs[key] = type to parseSettingValue(key, type, value)
         }
-        return out
+        val replacesElement = obj.get("replaces")
+        if (replacesElement == null || !replacesElement.isJsonArray) throw IllegalArgumentException("replaces必须是数组")
+        val replaces = replacesElement.asJsonArray.map { parseRule(it) }.filter { it.source.isNotBlank() }
+        return ParsedBackup(prefs, replaces)
     }
 
-    private fun extractTypedValue(obj: String, typeIdx: Int, valIdx: Int): Pair<String, String?> {
-        val tColon = obj.indexOf(':', typeIdx)
-        val tQ1 = obj.indexOf('"', tColon)
-        val tQ2 = obj.indexOf('"', tQ1 + 1)
-        val type = if (tQ1 >= 0 && tQ2 > tQ1) obj.substring(tQ1 + 1, tQ2) else "string"
-        val vColon = obj.indexOf(':', valIdx)
-        val vStart = vColon + 1
-        val vTrim = obj.substring(vStart).trimStart()
-        return if (vTrim.startsWith("\"")) {
-            val vEnd = vTrim.indexOf('"', 1)
-            type to (if (vEnd > 0) unescape(vTrim.substring(1, vEnd)) else null)
-        } else {
-            val vRaw = vTrim.takeWhile { !it.isWhitespace() && it != ',' && it != '}' }
-            type to vRaw
-        }
-    }
-
-    private fun unescape(s: String): String {
-        val sb = StringBuilder(s.length)
-        var i = 0
-        while (i < s.length) {
-            if (s[i] == '\\' && i + 1 < s.length) {
-                when (s[i + 1]) {
-                    'n' -> sb.append('\n')
-                    'r' -> sb.append('\r')
-                    't' -> sb.append('\t')
-                    '"' -> sb.append('"')
-                    '\\' -> sb.append('\\')
-                    '/' -> sb.append('/')
-                    else -> { sb.append('\\'); sb.append(s[i + 1]) }
-                }
-                i += 2
-            } else {
-                sb.append(s[i]); i++
+    private fun parseSettingValue(key: String, type: String, value: JsonElement?): Any {
+        if (type == "string" && (value == null || value.isJsonNull)) return ""
+        if (value == null || value.isJsonNull || !value.isJsonPrimitive) throw IllegalArgumentException("设置 $key 的值无效")
+        val primitive = value.asJsonPrimitive
+        return try {
+            when (type) {
+                "string" -> if (primitive.isString) primitive.asString else throw IllegalArgumentException()
+                "int" -> if (primitive.isNumber) primitive.asString.toLong().let {
+                    if (it !in Int.MIN_VALUE..Int.MAX_VALUE) throw IllegalArgumentException() else it.toInt()
+                } else throw IllegalArgumentException()
+                "long" -> if (primitive.isNumber) primitive.asString.toLong() else throw IllegalArgumentException()
+                "float" -> if (primitive.isNumber) primitive.asString.toFloat().also {
+                    if (!it.isFinite()) throw IllegalArgumentException()
+                } else throw IllegalArgumentException()
+                "boolean" -> if (primitive.isBoolean) primitive.asBoolean else throw IllegalArgumentException()
+                else -> throw IllegalArgumentException("设置 $key 的类型不支持: $type")
             }
-        }
-        return sb.toString()
+        } catch (_: Exception) { throw IllegalArgumentException("设置 $key 的值与类型不匹配") }
     }
 
-    private fun parseReplacesSection(text: String): List<TextPreprocessor.ReplaceRule> {
-        val marker = "\"replaces\""
-        val start = text.indexOf(marker)
-        if (start < 0) return emptyList()
-        val open = text.indexOf('[', start)
-        if (open < 0) return emptyList()
-        var depth = 0
-        var end = -1
-        for (i in open until text.length) {
-            when (text[i]) {
-                '[' -> depth++
-                ']' -> { depth--; if (depth == 0) { end = i; break } }
-            }
-        }
-        if (end < 0) return emptyList()
-        val section = text.substring(open + 1, end)
-        val out = ArrayList<TextPreprocessor.ReplaceRule>()
-        var i = 0
-        while (i < section.length) {
-            val brace = section.indexOf('{', i)
-            if (brace < 0) break
-            var d2 = 0
-            var bEnd = -1
-            for (j in brace until section.length) {
-                when (section[j]) {
-                    '{' -> d2++
-                    '}' -> { d2--; if (d2 == 0) { bEnd = j; break } }
-                }
-            }
-            if (bEnd < 0) break
-            val obj = section.substring(brace, bEnd + 1)
-            val name = extractStringField(obj, "name") ?: ""
-            val source = extractStringField(obj, "source") ?: ""
-            val target = extractStringField(obj, "target") ?: ""
-            val regex = extractBoolField(obj, "regex") ?: false
-            val activate = extractBoolField(obj, "activate") ?: true
-            val group = extractStringField(obj, "group") ?: "默认分组"
-            val pauseMs = extractIntField(obj, "pauseMs") ?: 0
-            if (source.isNotBlank()) {
-                out.add(TextPreprocessor.ReplaceRule(
-                    name, group, activate, regex, source, target, pauseMs))
-            }
-            i = bEnd + 1
-        }
-        return out
+    private fun parseRule(element: JsonElement): TextPreprocessor.ReplaceRule {
+        if (!element.isJsonObject) throw IllegalArgumentException("规则格式无效")
+        val o = element.asJsonObject
+        return TextPreprocessor.ReplaceRule(
+            stringField(o, "name", ""),
+            stringField(o, "group", "默认分组"),
+            boolField(o, "activate", true),
+            boolField(o, "regex", false),
+            stringField(o, "source", ""),
+            stringField(o, "target", ""),
+            intField(o, "pauseMs", 0)
+        )
     }
 
-    private fun extractStringField(obj: String, name: String): String? {
-        val p = obj.indexOf("\"$name\"")
-        if (p < 0) return null
-        val colon = obj.indexOf(':', p)
-        if (colon < 0) return null
-        val s = obj.substring(colon + 1).trimStart()
-        if (!s.startsWith("\"")) return null
-        val end = s.indexOf('"', 1)
-        return if (end > 0) unescape(s.substring(1, end)) else null
+    private fun stringField(o: JsonObject, name: String, default: String): String {
+        val e = o.get(name) ?: return default
+        if (e.isJsonNull) return default
+        if (!e.isJsonPrimitive || !e.asJsonPrimitive.isString) throw IllegalArgumentException("规则字段 $name 无效")
+        return e.asString
     }
 
-    private fun extractBoolField(obj: String, name: String): Boolean? {
-        val p = obj.indexOf("\"$name\"")
-        if (p < 0) return null
-        val colon = obj.indexOf(':', p)
-        if (colon < 0) return null
-        val v = obj.substring(colon + 1).trimStart().takeWhile { it != ',' && it != '}' }.trim()
-        return when (v.lowercase()) { "true" -> true; "false" -> false; else -> null }
+    private fun boolField(o: JsonObject, name: String, default: Boolean): Boolean {
+        val e = o.get(name) ?: return default
+        if (!e.isJsonPrimitive || !e.asJsonPrimitive.isBoolean) throw IllegalArgumentException("规则字段 $name 无效")
+        return e.asBoolean
     }
 
-    private fun extractIntField(obj: String, name: String): Int? {
-        val p = obj.indexOf("\"$name\"")
-        if (p < 0) return null
-        val colon = obj.indexOf(':', p)
-        if (colon < 0) return null
-        val v = obj.substring(colon + 1).trimStart().takeWhile { it.isDigit() || it == '-' }.trim()
-        return v.toIntOrNull()
+    private fun intField(o: JsonObject, name: String, default: Int): Int {
+        val e = o.get(name) ?: return default
+        if (!e.isJsonPrimitive) throw IllegalArgumentException("规则字段 $name 无效")
+        return e.asJsonPrimitive.asString.toLongOrNull()?.let { if (it in Int.MIN_VALUE..Int.MAX_VALUE) it.toInt() else null }
+            ?: throw IllegalArgumentException("规则字段 $name 无效")
     }
+
 }

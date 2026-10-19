@@ -135,10 +135,16 @@ class MainViewModel : ViewModel() {
         AppPrefs.saveDialogRoles(_dialog.value.roles)
         AppPrefs.saveDialogScript(_dialog.value.script)
     }
+    /** Settings import revision used to recreate Compose remembers backed by prefs. */
+    private val _settingsRevision = MutableStateFlow(0)
+    val settingsRevision: StateFlow<Int> = _settingsRevision.asStateFlow()
 
     /** 引擎列表版本号（语音包导入/删除后递增，驱动侧边栏/设置页重组） */
     private val _enginesVersion = MutableStateFlow(0)
     val enginesVersion: StateFlow<Int> = _enginesVersion.asStateFlow()
+
+    /** 语音列表请求序号；仅最后一次请求可以提交结果，避免旧请求污染新状态。 */
+    private var voiceLoadGeneration = 0L
 
     /** 当前播放用的 AudioTrack（微软引擎输出 24kHz 16bit 单声道 PCM） */
     @Volatile private var track: AudioTrack? = null
@@ -206,8 +212,9 @@ class MainViewModel : ViewModel() {
     val groupedEngines: Map<EngineCategory, List<TtsEngine>>
         get() = EngineRegistry.grouped()
 
-    /** 全部引擎（供侧边栏标题排序） */
-    val allEngines: List<TtsEngine> = EngineRegistry.all()
+    /** 全部引擎的当前快照；需要实时更新的 UI 应订阅注册表的 registeredEngines。 */
+    val allEngines: List<TtsEngine>
+        get() = EngineRegistry.all()
 
     /**
      * 刷新引擎注册（语音包导入/删除后调用）：
@@ -215,10 +222,34 @@ class MainViewModel : ViewModel() {
      */
     fun refreshEngines() {
         EngineRegistry.refreshImported()
-        // 若当前选中的引擎已被移除，回退到第一个可用引擎
-        val cur = _uiState.value.currentEngine?.code
-        if (cur != null && EngineRegistry.get(cur) == null) {
-            selectEngine(EngineRegistry.all().firstOrNull()?.code ?: "")
+
+        // Re-scan imported packages. Keep the rest of the UI state intact, but
+        // reload voices for the current engine so changed package contents appear.
+        val before = _uiState.value
+        val currentCode = before.currentEngine?.code
+        val refreshed = currentCode?.let { EngineRegistry.get(it) }
+        val next = refreshed ?: EngineRegistry.all().firstOrNull()
+        if (next != null) {
+            AppPrefs.setSelectedEngine(next.code)
+            _uiState.value = before.copy(
+                currentEngine = next,
+                voices = emptyList(),
+                loading = true,
+                selectedVoice = if (next.code == currentCode) before.selectedVoice else "",
+                error = null
+            )
+            loadVoices(next)
+        } else {
+            // Keep navigation/text even if the registry is temporarily empty.
+            // Invalidate an in-flight request before clearing the engine. Otherwise
+            // a late result can repopulate voices while the UI has no engine.
+            voiceLoadGeneration++
+            _uiState.value = before.copy(
+                currentEngine = null,
+                voices = emptyList(),
+                loading = false,
+                selectedVoice = ""
+            )
         }
         _settings.value = _settings.value.copy(engines = EngineRegistry.all())
         _enginesVersion.value++
@@ -242,20 +273,24 @@ class MainViewModel : ViewModel() {
     }
 
     private fun loadVoices(engine: TtsEngine) {
+        val generation = ++voiceLoadGeneration
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(loading = true)
             try {
                 val vs = withContext(Dispatchers.IO) { engine.listVoices() }
                 // ★ 恢复该引擎上次选择的发言人（重启/切引擎后保留，per-engine 维度）
                 val saved = AppPrefs.getSelectedVoice(engine.code)
+                if (generation != voiceLoadGeneration) return@launch
                 _uiState.value = _uiState.value.copy(
                     voices = vs,
                     loading = false,
                     selectedVoice = vs.firstOrNull { it.shortName == saved }?.shortName
+                        ?: vs.firstOrNull { it.shortName == _uiState.value.selectedVoice }?.shortName
                         ?: vs.firstOrNull()?.shortName ?: "",
                     error = null
                 )
             } catch (e: Exception) {
+                if (generation != voiceLoadGeneration) return@launch
                 MttsLog.e("Vm", "listVoices failed", e)
                 _uiState.value = _uiState.value.copy(
                     loading = false,
@@ -421,16 +456,59 @@ class MainViewModel : ViewModel() {
 
     /** 停止并释放当前播放 */
     fun stopPlayback() {
+        val oldTrack = track
+        track = null
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
-                try { track?.pause() } catch (_: Throwable) {}
-                try { track?.flush() } catch (_: Throwable) {}
-                try { track?.release() } catch (_: Throwable) {}
-                track = null
+                try { oldTrack?.pause() } catch (_: Throwable) {}
+                try { oldTrack?.flush() } catch (_: Throwable) {}
+                try { oldTrack?.release() } catch (_: Throwable) {}
             }
             _uiState.value = _uiState.value.copy(playing = false)
         }
     }
+
+    /**
+     * Re-read all VM-owned state after a successful settings import. Navigation
+     * and the current TTS draft live in uiState and are intentionally preserved;
+     * only imported selections/data are replaced. Request playback to stop first;
+     * the existing worker observes stopRequested rather than being cancelled here.
+     */
+    fun reloadAfterSettingsImport() {
+        stopRequested = true
+        val oldTrack = track
+        track = null
+        viewModelScope.launch(Dispatchers.IO) {
+            try { oldTrack?.pause() } catch (_: Throwable) {}
+            try { oldTrack?.flush() } catch (_: Throwable) {}
+            try { oldTrack?.release() } catch (_: Throwable) {}
+        }
+        _dialog.value = loadDialogState().copy(playing = false, progressLine = -1)
+        val current = _uiState.value
+        val savedCode = AppPrefs.getSelectedEngine()
+        val engine = EngineRegistry.get(savedCode ?: "")
+            ?: current.currentEngine
+            ?: EngineRegistry.all().firstOrNull()
+        if (engine != null) {
+            // Do not call selectEngine(): it resets draft text and navigation.
+            _uiState.value = current.copy(
+                currentEngine = engine,
+                voices = emptyList(),
+                selectedVoice = "",
+                loading = true,
+                synthesizing = false,
+                playing = false,
+                audioBytes = null,
+                audioReady = false,
+                error = null
+            )
+            loadVoices(engine)
+        }
+        _settings.value = _settings.value.copy(engines = EngineRegistry.all())
+        _enginesVersion.value++
+        _settingsRevision.value++
+    }
+
 
     /**
      * 计算指定音色的生效合成参数（speed/volume/pitch）。

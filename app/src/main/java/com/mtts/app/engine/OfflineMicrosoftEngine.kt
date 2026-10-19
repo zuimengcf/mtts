@@ -39,8 +39,9 @@ class OfflineMicrosoftEngine : TtsEngine {
     private val embeddedLicense = "ZCjZ7nHDSLvf4gpELteM4AnzaWUjTpn7UkV7D@vvksl0w1SNgon6d1905WANbktDc9S39oaA4r29HJNayXvTq8fJsq"
 
     /** 合成器缓存：对齐 MultiTTS h3/a 字段 f —— 每音色一个 SpeechSynthesizer，创建一次、反复复用 */
-    @Volatile private var synthCache: SpeechSynthesizer? = null
-    @Volatile private var synthCacheVoice: String = ""
+    private val synthLock = Any()
+    private var synthCache: SpeechSynthesizer? = null
+    private var synthCacheVoice: String = ""
 
     /** 中文每段最长字符数（MultiTTS X4/e 分片：中文 60 字/段，其他 100 字/段） */
     private val SEGMENT_LIMIT_ZH = 60
@@ -93,13 +94,26 @@ class OfflineMicrosoftEngine : TtsEngine {
     private fun synthesizeOne(
         text: String, voice: String, voiceParam: String,
         speed: Float, volume: Float, pitch: Float
+    ): ByteArray = synchronized(synthLock) {
+        synthesizeOneLocked(text, voice, voiceParam, speed, volume, pitch)
+    }
+
+    /** 必须在 synthLock 内执行：覆盖合成器切换、native 调用、结果读取和缓存清理的完整生命周期。 */
+    private fun synthesizeOneLocked(
+        text: String, voice: String, voiceParam: String,
+        speed: Float, volume: Float, pitch: Float
     ): ByteArray {
         var synth: SpeechSynthesizer? = null
+        var resultToClose: com.microsoft.cognitiveservices.speech.SpeechSynthesisResult? = null
         try {
             // 复用合成器：音色一致则直接用缓存的，否则重建
             val cached = synthCache
             if (cached == null || synthCacheVoice != voice) {
-                synthCache?.let { try { it.close() } catch (_: Throwable) {} }
+                // 先摘除缓存再 close；若新实例构造失败，不能把已关闭实例留在缓存中。
+                val old = synthCache
+                synthCache = null
+                synthCacheVoice = ""
+                old?.let { try { it.close() } catch (_: Throwable) {} }
                 val config = buildConfig(voice, voiceParam)
                 synth = SpeechSynthesizer(config, null)
                 synthCache = synth
@@ -117,6 +131,7 @@ class OfflineMicrosoftEngine : TtsEngine {
             //   （直接 result.getAudioData() 在 embedded SDK 下只返回约 1/10 数据，
             //    audioDuration=3.06s 却只有 0.3s 对应字节 → 短台词几乎无声。）
             val result = synth.SpeakSsmlAsync(ssml).get()
+            resultToClose = result
             if (result.reason == com.microsoft.cognitiveservices.speech.ResultReason.Canceled) {
                 try {
                     val json = result.properties.getProperty(
@@ -126,22 +141,29 @@ class OfflineMicrosoftEngine : TtsEngine {
             }
 
             val collected = java.io.ByteArrayOutputStream()
+            var stream: com.microsoft.cognitiveservices.speech.AudioDataStream? = null
             try {
-                val stream = com.microsoft.cognitiveservices.speech.AudioDataStream.fromResult(result)
-                stream.setPosition(0)
+                stream = com.microsoft.cognitiveservices.speech.AudioDataStream.fromResult(result)
+                stream!!.setPosition(0)
                 val buf = ByteArray(0x12c0)   // MultiTTS 同款 4800 字节缓冲
                 while (true) {
-                    val n = stream.readData(buf)
+                    val n = stream!!.readData(buf)
                     if (n <= 0) break
                     collected.write(buf, 0, n.toInt())
                 }
-                try { stream.close() } catch (_: Throwable) {}
             } catch (e: Exception) {
                 MttsLog.w("MsEmbed", "AudioDataStream read failed, fallback getAudioData: ${e.message}")
                 collected.reset()
                 collected.write(result.audioData)
+            } finally {
+                try { stream?.close() } catch (_: Throwable) {}
             }
+            // 结果对象关闭后不能再读取其属性；先完整快照，再 close。
+            val resultAudioLength = result.audioLength
+            val resultAudioDuration = result.audioDuration
+            val resultReason = result.reason?.toString()
             try { result.close() } catch (_: Throwable) {}
+            resultToClose = null
 
             val audio = collected.toByteArray()
             // ★ 音量死区修复：SSML volume 只响应 ≤50%，>50% 的放大用 PCM 增益补偿
@@ -166,13 +188,14 @@ class OfflineMicrosoftEngine : TtsEngine {
             } else null
             MttsLog.d("MsEmbed", "synthesize result", mapOf(
                 "audioBytes" to finalAudio.size,
-                "audioLength" to result.audioLength,
-                "audioDuration" to result.audioDuration,
-                "reason" to result.reason?.toString()
+                "audioLength" to resultAudioLength,
+                "audioDuration" to resultAudioDuration,
+                "reason" to resultReason
             ) + (ampDiag ?: emptyMap()))
             return finalAudio
         } catch (e: Exception) {
             MttsLog.e("MsEmbed", "synthesize failed", e)
+            try { resultToClose?.close() } catch (_: Throwable) {}
             // 合成失败时若用的是缓存合成器，丢弃缓存下次重建（可能缓存已损坏）
             if (synth == synthCache) {
                 try { synthCache?.close() } catch (_: Throwable) {}

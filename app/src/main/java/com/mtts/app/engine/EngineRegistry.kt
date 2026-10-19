@@ -2,6 +2,9 @@ package com.mtts.app.engine
 
 import com.mtts.app.util.MttsLog
 import java.io.File
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * 引擎注册表 —— 管理与提供所有引擎实例。
@@ -16,6 +19,9 @@ import java.io.File
 object EngineRegistry {
 
     private val engines: MutableMap<String, TtsEngine> = LinkedHashMap()
+    private val _registeredEngines = MutableStateFlow<List<TtsEngine>>(emptyList())
+    /** 注册、覆盖、移除或目录重扫后的快照，供页面订阅而非缓存启动时的列表。 */
+    val registeredEngines: StateFlow<List<TtsEngine>> = _registeredEngines.asStateFlow()
 
     /**
      * 引擎工厂：code → 引擎实例。
@@ -32,6 +38,7 @@ object EngineRegistry {
     /** 注册一个引擎（同名覆盖） */
     fun register(engine: TtsEngine): TtsEngine {
         engines[engine.code] = engine
+        _registeredEngines.value = all()
         return engine
     }
 
@@ -87,8 +94,13 @@ object EngineRegistry {
         }
         // ★ 引擎集合可能已变化 → 清空音色列表缓存（下次请求重新枚举）
         com.mtts.app.util.TtsVoicesCache.clear()
+        _registeredEngines.value = all()
     }
 
     /** 移除一个已动态注册的引擎（语音包被删除时） */
-    fun unregister(code: String): Boolean = engines.remove(code) != null
+    fun unregister(code: String): Boolean {
+        val removed = engines.remove(code) != null
+        if (removed) _registeredEngines.value = all()
+        return removed
+    }
 }

@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -21,10 +23,29 @@ android {
         }
     }
 
+    // 正式签名：凭据从 keystore.properties（本地，不入 git）读取；
+    // CI 通过环境变量覆盖（GitHub Secrets）：MTTS_STORE_FILE/MTTS_STORE_PASSWORD/MTTS_KEY_ALIAS/MTTS_KEY_PASSWORD
+    val keystoreProps = Properties().apply {
+        val f = file("../keystore.properties")
+        if (f.exists()) load(f.inputStream())
+    }
+    fun p(key: String, env: String, def: String) =
+        System.getenv(env) ?: keystoreProps.getProperty(key) ?: def
+
+    signingConfigs {
+        create("release") {
+            storeFile = file(p("storeFile", "MTTS_STORE_FILE", "../keystore/zuimeng.jks"))
+            storePassword = p("storePassword", "MTTS_STORE_PASSWORD", "")
+            keyAlias = p("keyAlias", "MTTS_KEY_ALIAS", "zuimeng")
+            keyPassword = p("keyPassword", "MTTS_KEY_PASSWORD", "")
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 

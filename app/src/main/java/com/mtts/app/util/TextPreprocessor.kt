@@ -176,11 +176,11 @@ object TextPreprocessor {
     private const val KEY_ROLE_RULES = "preprocess_role_rules"          // ★ 角色规则（MultiTTS RoleRule）：正则→发言人 每行
 
     // 各功能开关
-    fun isReplaceEnabled(): Boolean = AppPrefs.getBoolean(KEY_ENABLE_REPLACE, true)
-    fun isPolyEnabled(): Boolean = AppPrefs.getBoolean(KEY_ENABLE_POLY, true)
+    fun isReplaceEnabled(): Boolean = AppPrefs.getBoolean(KEY_ENABLE_REPLACE, false)
+    fun isPolyEnabled(): Boolean = AppPrefs.getBoolean(KEY_ENABLE_POLY, false)
     fun isDialogEnabled(): Boolean = AppPrefs.getBoolean(KEY_ENABLE_DIALOG, false)
-    fun isEmojiEnabled(): Boolean = AppPrefs.getBoolean(KEY_ENABLE_EMOJI, true)   // ★ 表情符号处理默认开
-    fun isSmartEnabled(): Boolean = AppPrefs.getBoolean(KEY_ENABLE_SMART, true)   // ★ 智能识别默认开
+    fun isEmojiEnabled(): Boolean = AppPrefs.getBoolean(KEY_ENABLE_EMOJI, false)   // ★ 表情符号处理
+    fun isSmartEnabled(): Boolean = AppPrefs.getBoolean(KEY_ENABLE_SMART, false)   // ★ 智能识别
 
     fun setReplaceEnabled(on: Boolean) = AppPrefs.putBoolean(KEY_ENABLE_REPLACE, on)
     fun setPolyEnabled(on: Boolean) = AppPrefs.putBoolean(KEY_ENABLE_POLY, on)

@@ -9,6 +9,7 @@ import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.file.Files
 import java.util.concurrent.TimeUnit
 
 /**
@@ -210,32 +211,67 @@ object SherpaModelDownload {
     /** 解压 tar.bz2 到目标目录，自动剥离共同顶层目录 */
     private fun extractTarBz2(tarFile: File, outDir: File) {
         val tmpDir = File(outDir.parentFile, "${outDir.name}.tmp").apply { deleteRecursively(); mkdirs() }
-        var topLevel: String? = null
-        var first = true
-        TarArchiveInputStream(BZip2CompressorInputStream(tarFile.inputStream().buffered())).use { tin ->
-            var entry: TarArchiveEntry? = tin.nextTarEntry
-            while (entry != null) {
-                val entryName = entry.name.trimStart('/')
-                if (entryName.isNotEmpty()) {
-                    val top = entryName.substringBefore('/')
-                    if (first) { topLevel = top; first = false }
-                    if (topLevel != null && top == topLevel) {
-                        val rel = entryName.substring(top.length + 1)
-                        if (rel.isNotEmpty()) {
-                            val dest = File(tmpDir, rel)
-                            if (entry.isDirectory) dest.mkdirs()
-                            else {
-                                dest.parentFile?.mkdirs()
-                                FileOutputStream(dest).use { out -> tin.copyTo(out) }
-                            }
+        try {
+            var topLevel: String? = null
+            val tmpCanonical = tmpDir.canonicalFile
+            TarArchiveInputStream(BZip2CompressorInputStream(tarFile.inputStream().buffered())).use { tin ->
+                var entry: TarArchiveEntry? = tin.nextTarEntry
+                while (entry != null) {
+                    val entryName = entry.name
+                    require(entryName.isNotEmpty() && !entryName.contains('\\')) { "非法 TAR 路径：$entryName" }
+                    require(!File(entryName).isAbsolute &&
+                        !entryName.matches(Regex("^[A-Za-z]:/.*"))) { "非法 TAR 绝对路径：$entryName" }
+                    val parts = entryName.split('/')
+                    require(parts.none { it == ".." }) { "非法 TAR 路径穿越：$entryName" }
+                    require(parts.drop(1).dropLastWhile { it.isEmpty() }.none { it.isEmpty() }) {
+                        "非法 TAR 路径：$entryName"
+                    }
+                    require(!entry.isSymbolicLink && !entry.isLink) { "TAR 不允许链接条目：$entryName" }
+                    require(entry.isDirectory || entry.isFile) { "不支持的 TAR 条目：$entryName" }
+
+                    val top = parts.first()
+                    if (topLevel == null) topLevel = top
+                    require(top == topLevel) { "TAR 包含不同顶层目录：$entryName" }
+                    val relParts = parts.drop(1).dropLastWhile { it.isEmpty() }
+                    if (relParts.isNotEmpty()) {
+                        val dest = File(tmpDir, relParts.joinToString(File.separator))
+                        require(dest.canonicalFile.path == tmpCanonical.path ||
+                            dest.canonicalFile.path.startsWith(tmpCanonical.path + File.separator)) {
+                            "非法 TAR 目标路径：$entryName"
+                        }
+                        require(!Files.isSymbolicLink(dest.toPath())) { "TAR 目标不允许符号链接：$entryName" }
+                        if (entry.isDirectory) dest.mkdirs()
+                        else {
+                            dest.parentFile?.mkdirs()
+                            FileOutputStream(dest).use { out -> tin.copyTo(out) }
                         }
                     }
+                    entry = tin.nextTarEntry
                 }
-                entry = tin.nextTarEntry
             }
+            // 搬到目标目录；递归复制，避免顶层目录的 copyTo 只复制目录元数据。
+            val outCanonical = outDir.canonicalFile
+            tmpDir.listFiles()?.forEach { copyTreeSafely(it, File(outDir, it.name), outCanonical) }
+        } finally {
+            tmpDir.deleteRecursively()
         }
-        // 搬到目标目录
-        tmpDir.listFiles()?.forEach { it.copyTo(File(outDir, it.name), overwrite = true) }
-        tmpDir.deleteRecursively()
+    }
+
+    private fun copyTreeSafely(source: File, target: File, outCanonical: File) {
+        require(!Files.isSymbolicLink(source.toPath())) { "不允许搬运符号链接：${source.path}" }
+        require(!Files.isSymbolicLink(target.toPath())) { "不允许覆盖符号链接：${target.path}" }
+        require(target.canonicalFile.path == outCanonical.path ||
+            target.canonicalFile.path.startsWith(outCanonical.path + File.separator)) {
+            "非法 TAR 目标路径：${target.path}"
+        }
+        if (source.isDirectory) {
+            target.mkdirs()
+            source.listFiles()?.forEach { copyTreeSafely(it, File(target, it.name), outCanonical) }
+        } else if (source.isFile) {
+            target.parentFile?.mkdirs()
+            source.copyTo(target, overwrite = true)
+        } else {
+            throw IllegalArgumentException("不支持的 TAR 条目：${source.path}")
+        }
     }
 }

@@ -1,0 +1,53 @@
+name: Build release APK
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Restore signing keystore from secrets
+        run: |
+          mkdir -p android/keystore
+          echo "${{ secrets.MTTS_KEYSTORE_BASE64 }}" | base64 -d > android/keystore/zuimeng.jks
+          ls -l android/keystore/zuimeng.jks
+
+      - name: Build release APK (signed)
+        run: |
+          cd android
+          export MTTS_STORE_FILE=../keystore/zuimeng.jks
+          export MTTS_STORE_PASSWORD="${{ secrets.MTTS_STORE_PASSWORD }}"
+          export MTTS_KEY_ALIAS="${{ secrets.MTTS_KEY_ALIAS }}"
+          export MTTS_KEY_PASSWORD="${{ secrets.MTTS_KEY_PASSWORD }}"
+          gradle :app:assembleRelease --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtts-release-apk
+          path: android/app/build/outputs/apk/release/app-release.apk
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: android/app/build/outputs/apk/release/app-release.apk
+          generate_release_notes: true

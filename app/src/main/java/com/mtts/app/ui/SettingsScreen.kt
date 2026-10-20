@@ -241,7 +241,9 @@ private fun EnginesContent(vm: MainViewModel) {
     var warmup by remember { mutableStateOf(com.mtts.app.util.AppPrefs.isSherpaWarmupEnabled()) }
     // 百度密钥对话框
     var showBdKeyDialog by remember { mutableStateOf(false) }
-    Column {
+    // 微软嵌入式 license 对话框
+    var showMsLicenseDialog by remember { mutableStateOf(false) }
+    Column(Modifier.verticalScroll(rememberScrollState())) {
         AppSectionTitle(ctx.getString(R.string.registered_engines))
         Spacer(Modifier.padding(8.dp))
         settings.engines.forEach { engine ->
@@ -317,8 +319,43 @@ private fun EnginesContent(vm: MainViewModel) {
                 }
             }
         }
+        // 微软嵌入式授权 license（仅当 microsoft 引擎已注册时显示）
+        if (settings.engines.any { it.code == "microsoft" }) {
+            Spacer(Modifier.padding(8.dp))
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+                shape = MaterialTheme.shapes.large
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("微软嵌入式授权 license", style = MaterialTheme.typography.bodyLarge)
+                    Spacer(Modifier.height(4.dp))
+                    Text("离线合成需填微软嵌入式语音授权 license。密钥仅存本设备，不随仓库分发。",
+                         style = MaterialTheme.typography.bodySmall,
+                         color = MaterialTheme.colorScheme.secondary)
+                    Spacer(Modifier.height(8.dp))
+                    val hasMsLic = com.mtts.app.util.AppPrefs.getMsLicense().isNotBlank()
+                    Text(
+                        if (hasMsLic) "已配置" else "未配置",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (hasMsLic) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    AppOutlinedButton(
+                        text = if (hasMsLic) "修改 license" else "填写 license",
+                        onClick = { showMsLicenseDialog = true }
+                    )
+                }
+            }
+        }
     }
 
+    if (showMsLicenseDialog) {
+        MsLicenseConfigDialog(
+            onDismiss = { showMsLicenseDialog = false }
+        )
+    }
     if (showBdKeyDialog) {
         BdKeyConfigDialog(
             onDismiss = { showBdKeyDialog = false }
@@ -380,6 +417,42 @@ private fun BdKeyConfigDialog(onDismiss: () -> Unit) {
                     com.mtts.app.util.AppPrefs.setBdAppSecret("9294715", secret929)
                     com.mtts.app.util.AppPrefs.setBdAppKey("37111357", key371)
                     com.mtts.app.util.AppPrefs.setBdAppSecret("37111357", secret371)
+                    onDismiss()
+                }
+            )
+        },
+        dismissButton = {
+            AppOutlinedButton(text = "取消", onClick = onDismiss)
+        }
+    )
+}
+
+/** 微软嵌入式授权 license 配置对话框 */
+@Composable
+private fun MsLicenseConfigDialog(onDismiss: () -> Unit) {
+    var lic by remember { mutableStateOf(com.mtts.app.util.AppPrefs.getMsLicense()) }
+
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("微软嵌入式授权 license") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = lic, onValueChange = { lic = it },
+                    label = { Text("license") }, singleLine = false,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                Text("离线合成需填的嵌入式语音授权 license。仅存本设备，不随仓库分发。",
+                     style = MaterialTheme.typography.bodySmall,
+                     color = MaterialTheme.colorScheme.secondary)
+            }
+        },
+        confirmButton = {
+            AppPrimaryButton(
+                text = "保存",
+                onClick = {
+                    com.mtts.app.util.AppPrefs.setMsLicense(lic)
                     onDismiss()
                 }
             )

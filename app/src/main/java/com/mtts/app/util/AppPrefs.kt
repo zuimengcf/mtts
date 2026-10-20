@@ -486,6 +486,18 @@ object AppPrefs {
     fun setBdAppSecret(modelCode: String, value: String) =
         putString(KEY_BD_APPSECRET_PREFIX + modelCode, value.trim())
 
+    // ---------- 微软嵌入式授权 license（用户在引擎页填写，持久化保存） ----------
+
+    private const val KEY_MS_LICENSE = "ms_embedded_license"
+
+    /** 读取微软嵌入式 license（未设置返回空串） */
+    fun getMsLicense(): String =
+        getString(KEY_MS_LICENSE, "") ?: ""
+
+    /** 保存微软嵌入式 license */
+    fun setMsLicense(value: String) =
+        putString(KEY_MS_LICENSE, value.trim())
+
     // ---------- 保活 / 退出开关 ----------
 
     private const val KEY_KEEP_ALIVE = "keep_alive_enabled"

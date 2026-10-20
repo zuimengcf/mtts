@@ -35,8 +35,22 @@ class OfflineMicrosoftEngine : TtsEngine {
     private val modelDir: File?
         get() = VoicePackageManager.root?.let { File(it, "microsoft") }
 
-    /** 嵌入式语音 license（MultiTTS 嵌入式扩展签名，引擎运行必需；与控制引擎代码/音色列表硬编码无关） */
-    private val embeddedLicense = "ZCjZ7nHDSLvf4gpELteM4AnzaWUjTpn7UkV7D@vvksl0w1SNgon6d1905WANbktDc9S39oaA4r29HJNayXvTq8fJsq"
+    /**
+     * 嵌入式语音 license（MultiTTS 嵌入式扩展签名）。
+     * 为避免明文入库泄露，运行时不内置，取值优先级：
+     *   ① 用户在引擎设置页填写的值（AppPrefs 持久化，不落源码、不随仓库分发）
+     *   ② 语音包目录外部文件 voice/microsoft/.tts_license（本地导入时预置）
+     * 均未配置时返回空（实测 SDK 对授权音色在空 license 下仍可合成）。
+     */
+    private fun embeddedLicense(): String {
+        // ① 用户在设置页填写（优先）
+        com.mtts.app.util.AppPrefs.getMsLicense().trim().takeIf { it.isNotEmpty() }?.let { return it }
+        // ② 语音包目录外部文件
+        return runCatching {
+            val licFile = File(modelDir ?: return@runCatching null, ".tts_license")
+            if (licFile.isFile) licFile.readText().trim() else null
+        }.getOrNull() ?: ""
+    }
 
     /** 合成器缓存：对齐 MultiTTS h3/a 字段 f —— 每音色一个 SpeechSynthesizer，创建一次、反复复用 */
     private val synthLock = Any()
@@ -246,7 +260,7 @@ class OfflineMicrosoftEngine : TtsEngine {
         val voiceShort = voice.ifBlank { voices().firstOrNull()?.shortName ?: "" }
         val voiceModel = File(modelDir, voiceShort)
         val config = EmbeddedSpeechConfig.fromPath(voiceModel.absolutePath)
-        config.setSpeechSynthesisVoice(voiceParam, embeddedLicense)
+        config.setSpeechSynthesisVoice(voiceParam, embeddedLicense())
         config.setSpeechSynthesisOutputFormat(SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm)
         return config
     }

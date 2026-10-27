@@ -412,6 +412,8 @@ class MainViewModel : ViewModel() {
             return
         }
 
+        // 每次新播放会话清除上次 stopPlayback 留下的标志。
+        stopRequested = false
         viewModelScope.launch {
             _uiState.value = state.copy(playing = true, synthesizing = true, error = null, audioReady = false)
             try {
@@ -577,6 +579,7 @@ class MainViewModel : ViewModel() {
         val text = _uiState.value.text.ifBlank { AppPrefs.getTestText() }
         if (text.isBlank()) { _uiState.value = _uiState.value.copy(error = str(R.string.err_need_input)); return }
 
+        stopRequested = false
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(playing = true, synthesizing = true, error = null, audioReady = false)
             try {
@@ -890,6 +893,7 @@ class MainViewModel : ViewModel() {
         val engine = state.currentEngine ?: return
         val voice = state.selectedVoice
 
+        stopRequested = false
         viewModelScope.launch {
             _uiState.value = state.copy(playing = true, synthesizing = true, error = null, audioReady = false)
             try {

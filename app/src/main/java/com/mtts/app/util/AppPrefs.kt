@@ -748,16 +748,27 @@ object AppPrefs {
         val map = loadSfxMap().toMutableList()
         val kws = loadSfxKeywords().toMutableList()
         var changed = false
+        var copyFailed = false
         for (asset in names) {
             val name = asset.substringBeforeLast('.').trim()
             if (name.isBlank()) continue
             val dest = java.io.File(dir, asset)
             if (!dest.exists() || dest.length() == 0L) {
+                var temp: java.io.File? = null
                 try {
+                    val tempFile = java.io.File.createTempFile("mtts_${dest.name}_", ".part", dir)
+                    temp = tempFile
                     ctx.assets.open("$BUILTIN_SFX_DIR/$asset").use { input ->
-                        dest.outputStream().use { output -> input.copyTo(output) }
+                        tempFile.outputStream().use { output -> input.copyTo(output) }
                     }
-                } catch (t: Throwable) { continue }
+                    if (dest.exists() && !dest.delete()) throw java.io.IOException("cannot replace ${dest.name}")
+                    if (!tempFile.renameTo(dest)) throw java.io.IOException("cannot install ${dest.name}")
+                    temp = null
+                } catch (t: Throwable) {
+                    try { temp?.delete() } catch (_: Throwable) {}
+                    copyFailed = true
+                    continue
+                }
             }
             if (dest.exists() && dest.length() > 0L && map.none { it.first == name }) {
                 map.add(name to dest.absolutePath)
@@ -774,6 +785,6 @@ object AppPrefs {
             saveSfxKeywords(kws)
             SoundEffectManager.clearCache()
         }
-        putBoolean(KEY_SFX_BUILTIN_IMPORTED, true)
+        if (!copyFailed) putBoolean(KEY_SFX_BUILTIN_IMPORTED, true)
     }
 }

@@ -344,6 +344,7 @@ object SettingsBackup {
 
         // 2) 注册表：路径优先用包内文件（同名 basename），包内没有且原路径存在则保留，否则丢弃该条
         var mapCount = 0
+        var mapNames = loadSfxMapList(p).map { it.first }.toSet()
         if (mapText.isNotBlank()) {
             val old = loadSfxMapList(p)
             val out = LinkedHashMap<String, String>()
@@ -364,13 +365,13 @@ object SettingsBackup {
                 for ((k, v) in old) if (!out.containsKey(k)) out[k] = v
                 editor.putString("sfx_map", out.entries.joinToString("") { "${it.key}|${it.value}\n" })
                 mapCount = out.size
+                mapNames = out.keys.toSet()
             }
         }
 
         // 3) 关键词表：合并（同关键词覆盖），且只保留注册表里存在的标记
         var kwCount = 0
         if (kwText.isNotBlank()) {
-            val mapNames = loadSfxMapList(p).map { it.first }.toSet()
             val merged = LinkedHashMap<String, String>()
             val oldKw = loadSfxKwList(p)
             for ((k, v) in oldKw) merged[k] = v

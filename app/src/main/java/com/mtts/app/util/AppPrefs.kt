@@ -572,4 +572,208 @@ object AppPrefs {
     fun setKeepAliveEnabledSync(on: Boolean) {
         prefs()?.edit()?.putBoolean(KEY_KEEP_ALIVE, on)?.commit()
     }
+
+    // ---------- 音效功能（BGM + 短音效） ----------
+
+    private const val KEY_BGM_ENABLED = "sfx_bgm_enabled"
+    private const val KEY_BGM_PATH = "sfx_bgm_path"
+    private const val KEY_BGM_VOLUME = "sfx_bgm_volume"
+    private const val KEY_SFX_ENABLED = "sfx_sfx_enabled"
+    private const val KEY_SFX_VOLUME = "sfx_sfx_volume"
+    private const val KEY_SFX_MAP = "sfx_map"          // 每行：标记名|文件路径
+    private const val KEY_SFX_KEYWORDS = "sfx_keywords" // 每行：关键词|标记名
+
+    fun isBgmEnabled(): Boolean = getBoolean(KEY_BGM_ENABLED, false)
+    fun setBgmEnabled(on: Boolean) = putBoolean(KEY_BGM_ENABLED, on)
+
+    fun getBgmPath(): String = getString(KEY_BGM_PATH, "") ?: ""
+    fun setBgmPath(path: String) = putString(KEY_BGM_PATH, path.trim())
+
+    fun getBgmVolume(): Float = prefs()?.getFloat(KEY_BGM_VOLUME, 0.3f) ?: 0.3f
+    fun setBgmVolume(v: Float) { prefs()?.edit()?.putFloat(KEY_BGM_VOLUME, v)?.apply() }
+
+    fun isSfxEnabled(): Boolean = getBoolean(KEY_SFX_ENABLED, true)
+    fun setSfxEnabled(on: Boolean) = putBoolean(KEY_SFX_ENABLED, on)
+
+    fun getSfxVolume(): Float = prefs()?.getFloat(KEY_SFX_VOLUME, 0.8f) ?: 0.8f
+    fun setSfxVolume(v: Float) { prefs()?.edit()?.putFloat(KEY_SFX_VOLUME, v)?.apply() }
+
+    /** 音效注册表：每行 "标记名|文件路径" */
+    fun saveSfxMap(entries: List<Pair<String, String>>) {
+        val sb = StringBuilder()
+        for ((name, path) in entries) sb.append(name).append('|').append(path).append('\n')
+        putString(KEY_SFX_MAP, sb.toString())
+    }
+    fun loadSfxMap(): List<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>()
+        for (line in (getString(KEY_SFX_MAP, "") ?: "").lines()) {
+            val t = line.trim()
+            if (t.isEmpty()) continue
+            val p = t.split('|')
+            if (p.size >= 2 && p[0].isNotBlank() && p[1].isNotBlank()) out.add(p[0].trim() to p[1].trim())
+        }
+        return out
+    }
+
+    /** 关键词触发：每行 "关键词|标记名" */
+    fun saveSfxKeywords(entries: List<Pair<String, String>>) {
+        val sb = StringBuilder()
+        for ((kw, name) in entries) sb.append(kw).append('|').append(name).append('\n')
+        putString(KEY_SFX_KEYWORDS, sb.toString())
+    }
+    fun loadSfxKeywords(): List<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>()
+        for (line in (getString(KEY_SFX_KEYWORDS, "") ?: "").lines()) {
+            val t = line.trim()
+            if (t.isEmpty()) continue
+            val p = t.split('|')
+            if (p.size >= 2 && p[0].isNotBlank() && p[1].isNotBlank()) out.add(p[0].trim() to p[1].trim())
+        }
+        return out
+    }
+
+    // ---------- 内置示例音效（assets/soundfx，Mixkit，可免费商用） ----------
+
+    private const val KEY_SFX_BUILTIN_IMPORTED = "sfx_builtin_imported_v2"
+
+    /** 内置音效在私有目录的存放子目录名 */
+    const val BUILTIN_SFX_DIR = "soundfx"
+
+    /**
+     * 内置音效 → 自然语言触发关键词。
+     * 泛词（如「脚步」「雨」「开门」「魔法」）会被多个音效共享，
+     * 注册时形成多候选随机池：命中后每次随机选一个，不锁死同一个声音。
+     * 未列出的条目回退为同名关键词。
+     */
+    val BUILTIN_SFX_KEYWORDS: Map<String, List<String>> = mapOf(
+        "rain" to listOf("雨", "下雨", "雨声", "雨滴", "大雨", "小雨"),
+        "thunder" to listOf("雷", "雷声", "打雷", "雷鸣", "惊雷"),
+        "footstep" to listOf("脚步", "脚步声", "走路", "行走"),
+        "dog" to listOf("狗叫", "狗吠", "犬吠", "汪汪"),
+        "knock" to listOf("敲门", "叩门", "敲门声"),
+        "中世纪门锁" to listOf("开锁", "上锁", "门锁", "锁"),
+        "中型狗低吼" to listOf("低吼", "狗吼", "呜咽"),
+        "中型狗吠" to listOf("狗吠", "狗叫", "汪汪"),
+        "仙女传送" to listOf("传送", "瞬移", "魔法"),
+        "仙女闪亮" to listOf("闪亮", "星光", "闪烁", "魔法"),
+        "仙女闪光" to listOf("星光", "星尘", "闪光", "魔法"),
+        "倒水入杯" to listOf("倒水", "倒茶", "倒水声"),
+        "光法术" to listOf("圣光", "法术", "魔法", "光芒"),
+        "公鸡打鸣" to listOf("公鸡", "鸡叫", "鸡鸣"),
+        "冻土脚步" to listOf("脚步", "硬地脚步", "踩地"),
+        "剑刃挥动" to listOf("挥剑", "舞剑", "剑"),
+        "剑斩嗖" to listOf("斩击", "剑", "挥砍"),
+        "匕首挥砍" to listOf("匕首", "小刀", "刀"),
+        "卡通猫喵" to listOf("猫叫", "喵", "卡通"),
+        "卡通虫快跑" to listOf("虫子跑", "虫子"),
+        "吱呀关门" to listOf("关门", "吱呀", "关门声"),
+        "吱呀门开" to listOf("开门", "门开", "吱呀", "推门"),
+        "吱呀门开关" to listOf("开门", "关门", "吱呀"),
+        "喝水" to listOf("喝水", "饮水", "咕咚"),
+        "嘎吱脚步循环" to listOf("脚步", "嘎吱"),
+        "大猫呼噜" to listOf("呼噜", "猫咪", "猫"),
+        "女巫嗖" to listOf("女巫", "巫师", "魔法"),
+        "巨人脚步" to listOf("脚步", "巨人", "巨大"),
+        "快乐小狗吠" to listOf("小狗", "幼犬", "狗叫", "汪汪"),
+        "快剑挥砍" to listOf("挥砍", "剑", "斩"),
+        "快速剑击" to listOf("剑击", "格挡", "剑"),
+        "怒狗低吼" to listOf("狗", "低吼", "凶狗"),
+        "怪物脚步" to listOf("脚步", "怪物", "怪兽"),
+        "恐怖木门开" to listOf("开门", "木门", "恐怖"),
+        "愤怒猫喵" to listOf("猫叫", "喵", "哈气"),
+        "敲门厚木门" to listOf("敲门", "叩门"),
+        "木地板吱呀" to listOf("地板", "吱呀", "木地板"),
+        "机器人脚步" to listOf("脚步", "机器人", "机械"),
+        "林中小鸟" to listOf("鸟叫", "鸟鸣", "小鸟"),
+        "柜门关" to listOf("关门", "柜门"),
+        "森林奔跑" to listOf("奔跑", "跑", "树林"),
+        "森林跑动" to listOf("跑动", "奔跑", "草丛"),
+        "水泡" to listOf("冒泡", "咕噜", "水声"),
+        "水花" to listOf("水花", "溅水", "泼水", "水声"),
+        "泥泞脚步" to listOf("脚步", "泥泞", "踩泥"),
+        "深水泡" to listOf("冒泡", "咕嘟", "水声"),
+        "烦狗吠" to listOf("狗叫", "狗吠", "烦"),
+        "热带鸟叫" to listOf("鸟叫", "热带鸟", "鹦鹉"),
+        "牛叫" to listOf("牛叫", "哞", "牛"),
+        "狗吠两声" to listOf("狗叫", "狗吠", "汪汪"),
+        "狮子咆哮" to listOf("狮子", "狮吼", "咆哮"),
+        "狼嚎" to listOf("狼", "狼嚎", "狼叫"),
+        "猫咪喵叫" to listOf("猫叫", "喵", "猫咪"),
+        "监狱铁门" to listOf("铁门", "牢门", "开门", "关门"),
+        "石巨人行走" to listOf("脚步", "巨人", "石巨人"),
+        "硬币叮当" to listOf("叮当", "金币", "钱币"),
+        "硬币声" to listOf("硬币", "钱币", "金币"),
+        "硬币处理" to listOf("硬币", "数钱", "钱币"),
+        "老教堂门开" to listOf("开门", "教堂", "老门"),
+        "草地脚步" to listOf("脚步", "草地", "踩草"),
+        "草地行走" to listOf("脚步", "草地", "散步"),
+        "蟋蟀鸣叫" to listOf("蟋蟀", "虫鸣", "蛐蛐"),
+        "行军脚步" to listOf("脚步", "行军", "踏步"),
+        "跳入水中" to listOf("跳水", "落水", "水声"),
+        "重型推拉门" to listOf("推拉门", "拉门"),
+        "重草地脚步" to listOf("脚步", "草地", "沉重"),
+        "野兽咆哮" to listOf("野兽", "兽吼", "咆哮"),
+        "金属剑击" to listOf("剑击", "金属", "兵刃"),
+        "金属挥砍" to listOf("挥砍", "刀", "金属"),
+        "金币奖励" to listOf("金币", "奖励", "钱币"),
+        "金币胜利" to listOf("金币", "胜利", "钱币"),
+        "隧道脚步循环" to listOf("脚步", "隧道", "回声"),
+        "雁群" to listOf("大雁", "雁叫", "鸟叫"),
+        "雪地脚步" to listOf("脚步", "雪地", "踩雪"),
+        "饿猫喵" to listOf("猫叫", "喵", "饿"),
+        "马嘶" to listOf("马叫", "马嘶", "马"),
+        "马嘶鸣" to listOf("马叫", "马嘶", "长嘶"),
+        "高跟鞋脚步" to listOf("脚步", "高跟鞋"),
+        "魔法咒语" to listOf("咒语", "施法", "魔法"),
+        "魔法哨声" to listOf("哨声", "魔法"),
+        "魔法棒闪光" to listOf("魔法棒", "闪光", "魔法"),
+        "魔法通知铃" to listOf("铃声", "通知", "提示音"),
+        "魔法闪光" to listOf("闪光", "魔法"),
+        "魔法闪光嗖" to listOf("闪现", "魔法", "闪光"),
+        "龙咆哮" to listOf("龙", "龙吼", "咆哮")
+    )
+
+    /**
+     * 首次启动把 assets/soundfx 内置音效解压到私有目录并注册进音效表 + 关键词表。
+     * 动态枚举 assets：目录里放多少就注册多少；文件名（去扩展名）即标记名。
+     * 只补缺：用户已注册同名标记则跳过，绝不覆盖用户配置。
+     */
+    fun ensureBuiltinSfxImported() {
+        val ctx = MttsApplication.ctx() ?: return
+        if (getBoolean(KEY_SFX_BUILTIN_IMPORTED, false)) return
+        val names = try { ctx.assets.list(BUILTIN_SFX_DIR)?.toList() ?: emptyList() } catch (_: Throwable) { emptyList() }
+        if (names.isEmpty()) return
+        val dir = java.io.File(ctx.getExternalFilesDir(null), BUILTIN_SFX_DIR)
+        dir.mkdirs()
+        val map = loadSfxMap().toMutableList()
+        val kws = loadSfxKeywords().toMutableList()
+        var changed = false
+        for (asset in names) {
+            val name = asset.substringBeforeLast('.').trim()
+            if (name.isBlank()) continue
+            val dest = java.io.File(dir, asset)
+            if (!dest.exists() || dest.length() == 0L) {
+                try {
+                    ctx.assets.open("$BUILTIN_SFX_DIR/$asset").use { input ->
+                        dest.outputStream().use { output -> input.copyTo(output) }
+                    }
+                } catch (t: Throwable) { continue }
+            }
+            if (dest.exists() && dest.length() > 0L && map.none { it.first == name }) {
+                map.add(name to dest.absolutePath)
+                // 开箱即用关键词：映射表优先（泛词共享→随机池），否则同名
+                val kwsFor = BUILTIN_SFX_KEYWORDS[name] ?: listOf(name)
+                for (kw in kwsFor) {
+                    if (kw.isNotBlank()) kws.add(kw to name)
+                }
+                changed = true
+            }
+        }
+        if (changed) {
+            saveSfxMap(map)
+            saveSfxKeywords(kws)
+            SoundEffectManager.clearCache()
+        }
+        putBoolean(KEY_SFX_BUILTIN_IMPORTED, true)
+    }
 }

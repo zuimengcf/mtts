@@ -6,6 +6,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.media.MediaPlayer
 import com.mtts.app.MttsApplication
 import com.mtts.app.R
 import com.mtts.app.engine.EngineCategory
@@ -57,6 +58,7 @@ enum class SettingsItem(val label: String, val desc: String) {
     PREPROCESS("文本预处理", "文字替换 / 多音字"),
     TEST_TEXT("测试文本", "修改内置测试的默认文本"),
     HTTP_SERVER("HTTP 网关", "端口号 / 开关，供外部调用本地引擎"),
+    SOUND_FX("音效", "背景音乐 BGM / 短音效触发"),
     LOGS("日志", "查看运行日志"),
     SETTINGS_IO("全局设置导入导出", "除语音包外的全部设置一键导入 / 导出"),
     ABOUT("关于", "版本 / 项目信息")
@@ -414,6 +416,7 @@ class MainViewModel : ViewModel() {
             _uiState.value = state.copy(playing = true, synthesizing = true, error = null, audioReady = false)
             try {
                 withContext(Dispatchers.IO) {
+                    startBgmLoop()
                     // 1) 一次性合成完整 PCM（16bit / 单声道，引擎真实采样率：微软 24k / 搜狗百度 16k）
                     val (spd, vol, pit) = effectiveVoiceParams(engine, voice)
                     // ★ 标记处理（停顿/音量/音调）：与 TtsService 一致，
@@ -440,12 +443,14 @@ class MainViewModel : ViewModel() {
                     // ★ 统一 24kHz 播放（playPcm 内部会把 16k 数据重采样到 24k）：
                     //   本设备直接建 16kHz AudioTrack 会无声（playbackHeadPosition 冻结、write 无效），
                     //   而 24kHz 一直正常。重采样后音调/语速不变、无杂音。
-                    playPcm(pcm, voiceSampleRate(voice, engine.code))
+                    playPcm(pcm, voiceSampleRate(voice, engine.code), effectiveSfxAt(text))
                 }
+                stopBgmLoop()
                 _uiState.value = _uiState.value.copy(playing = false, synthesizing = false)
             } catch (e: Exception) {
                 MttsLog.e("Vm", "play failed", e)
                 stopPlayback()
+                stopBgmLoop()
                 _uiState.value = _uiState.value.copy(
                     playing = false, synthesizing = false,
                     error = e.message ?: str(R.string.err_play_failed)
@@ -456,12 +461,14 @@ class MainViewModel : ViewModel() {
 
     /** 停止并释放当前播放 */
     fun stopPlayback() {
+        stopRequested = true
         val oldTrack = track
+        // ★ 同步立即静音，release 异步（与 stopDialog 一致，消除阻塞 write 竞争窗口）
+        try { oldTrack?.pause() } catch (_: Throwable) {}
+        try { oldTrack?.flush() } catch (_: Throwable) {}
         track = null
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
-                try { oldTrack?.pause() } catch (_: Throwable) {}
-                try { oldTrack?.flush() } catch (_: Throwable) {}
                 try { oldTrack?.release() } catch (_: Throwable) {}
             }
             _uiState.value = _uiState.value.copy(playing = false)
@@ -596,12 +603,15 @@ class MainViewModel : ViewModel() {
                         pcm = pcm + silence
                     }
                     // ★ 用音色真实采样率播放（搜狗/百度 16kHz、微软 24kHz）
-                    playPcm(pcm, voiceSampleRate(voice, engine.code))
+                    startBgmLoop()
+                    playPcm(pcm, voiceSampleRate(voice, engine.code), effectiveSfxAt(text))
                 }
+                stopBgmLoop()
                 _uiState.value = _uiState.value.copy(playing = false, synthesizing = false)
             } catch (e: Exception) {
                 MttsLog.e("Vm", "preview failed", e)
                 stopPlayback()
+                stopBgmLoop()
                 _uiState.value = _uiState.value.copy(
                     playing = false, synthesizing = false,
                     error = e.message ?: str(R.string.err_preview_failed)
@@ -611,16 +621,168 @@ class MainViewModel : ViewModel() {
     }
 
     /**
+     * 音效混音辅助（应用内播放路径统一入口）：
+     * BGM 循环混入 + ⟨sfx:名⟩ 音效混入（在重采样后的 24kHz PCM 上执行）。
+     * 配置关闭/文件未配置时原样返回。
+     */
+    private fun applySoundFx(pcm24k: ByteArray, sfxItems: List<com.mtts.app.util.TextPreprocessor.SfxAt>): ByteArray {
+        val ctx = MttsApplication.ctx() ?: return pcm24k
+        // 同步配置
+        com.mtts.app.util.SoundEffectManager.bgmEnabled = AppPrefs.isBgmEnabled()
+        com.mtts.app.util.SoundEffectManager.bgmPath = AppPrefs.getBgmPath()
+        com.mtts.app.util.SoundEffectManager.bgmVolume = AppPrefs.getBgmVolume()
+        com.mtts.app.util.SoundEffectManager.sfxEnabled = AppPrefs.isSfxEnabled()
+        com.mtts.app.util.SoundEffectManager.sfxVolume = AppPrefs.getSfxVolume()
+        com.mtts.app.util.SoundEffectManager.sfxMap = AppPrefs.loadSfxMap().toMap()
+
+        var bytes = pcm24k
+        // ★ BGM 不再逐句混入：改由常驻 BGM AudioTrack 并行循环播放（见 startBgmLoop），
+        //   句间合成等待期间 BGM 也连续；此处只负责 ⟨sfx:⟩ 短音效混入
+        // 2) 音效标记混入（按标记位置比例映射，回退 0.2s 对齐开口瞬间）
+        if (com.mtts.app.util.SoundEffectManager.sfxEnabled && sfxItems.isNotEmpty()) {
+            var samples = bytesToShorts(bytes)
+            for (item in sfxItems) {
+                val sfx = com.mtts.app.util.SoundEffectManager.getSfxPcm(ctx, item.name)
+                if (sfx != null) {
+                    val at = ((samples.size - 1) * item.at - 4800).toInt()
+                        .coerceIn(0, samples.size - 1)
+                    samples = com.mtts.app.util.SoundEffectManager.mixSfx(
+                        samples, at, sfx, com.mtts.app.util.SoundEffectManager.sfxVolume)
+                }
+            }
+            bytes = shortsToBytes(samples)
+        }
+        return bytes
+    }
+
+    /** BGM 全局样本偏移（应用内播放路径，跨次播放连续） */
+    private var bgmOffsetSamples = 0
+
+    // ---------------- 连续 BGM 播放器 ----------------
+    // ★ 用 MediaPlayer 独立播放 BGM：与语音 PCM 管线完全解耦，
+    //   系统音频焦点自动混音，setLooping(true) 无缝循环。
+    //   语音怎么停顿/合成等待/被停，BGM 都连续不断。
+
+    @Volatile private var bgmPlayer: MediaPlayer? = null
+
+    /** 启动独立 BGM 播放（已启动则忽略；未启用 BGM/未选文件则不启动） */
+    private fun startBgmLoop() {
+        val ctx = MttsApplication.ctx() ?: return
+        if (!AppPrefs.isBgmEnabled()) return
+        val path = AppPrefs.getBgmPath()
+        if (path.isBlank()) return
+        stopBgmLoop()   // 先清掉旧的（文件可能已换）
+        try {
+            val mp = MediaPlayer()
+            mp.setDataSource(path)
+            mp.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build())
+            mp.setLooping(true)
+            mp.setVolume(AppPrefs.getBgmVolume(), AppPrefs.getBgmVolume())
+            mp.prepare()
+            mp.start()
+            bgmPlayer = mp
+            MttsLog.d("Vm", "bgm player start $path")
+        } catch (t: Throwable) {
+            MttsLog.e("Vm", "bgm player failed: ${t.message}")
+            try { bgmPlayer?.release() } catch (_: Throwable) {}
+            bgmPlayer = null
+        }
+    }
+
+    /** 停止并释放独立 BGM 播放 */
+    private fun stopBgmLoop() {
+        val mp = bgmPlayer ?: return
+        bgmPlayer = null
+        try { mp.stop() } catch (_: Throwable) {}
+        try { mp.release() } catch (_: Throwable) {}
+        MttsLog.d("Vm", "bgm player stop")
+    }
+
+    /**
+     * 计算一段文本实际生效的音效名列表：
+     * 显式 ⟨sfx:名⟩ 标记 + 关键词自动注入（命中关键词的音效名）。
+     */
+    fun effectiveSfxNames(text: String): List<String> {
+        if (!AppPrefs.isSfxEnabled()) return emptyList()
+        // 同步注册表
+        com.mtts.app.util.SoundEffectManager.sfxMap = AppPrefs.loadSfxMap().toMap()
+        val names = TextPreprocessor.extractSfx(text).toMutableList()
+        val raw = TextPreprocessor.stripAllMarkers(text)
+        val rnd = java.util.Random()
+        val pool = HashMap<String, MutableList<String>>()
+        for ((kw, name) in AppPrefs.loadSfxKeywords()) {
+            if (kw.isNotBlank() &&
+                com.mtts.app.util.SoundEffectManager.sfxMap.containsKey(name)) {
+                pool.getOrPut(kw) { mutableListOf() }.add(name)
+            }
+        }
+        for ((kw, cands) in pool) {
+            if (raw.contains(kw)) names.add(cands[rnd.nextInt(cands.size)])
+        }
+        return names
+    }
+
+    /**
+     * 计算一段文本「带位置」的音效列表：
+     * 显式 ⟨sfx:名⟩（带位置）+ 关键词自动注入（关键词在文中的位置）。
+     */
+    fun effectiveSfxAt(text: String): List<com.mtts.app.util.TextPreprocessor.SfxAt> {
+        if (!AppPrefs.isSfxEnabled()) return emptyList()
+        com.mtts.app.util.SoundEffectManager.sfxMap = AppPrefs.loadSfxMap().toMap()
+        val out = TextPreprocessor.extractSfxAt(text).toMutableList()
+        val raw = TextPreprocessor.stripAllMarkers(text)
+        val rnd = java.util.Random()
+        val pool = HashMap<String, MutableList<String>>()
+        for ((kw, name) in AppPrefs.loadSfxKeywords()) {
+            if (kw.isNotBlank() &&
+                com.mtts.app.util.SoundEffectManager.sfxMap.containsKey(name)) {
+                pool.getOrPut(kw) { mutableListOf() }.add(name)
+            }
+        }
+        // 关键词在剥离标记后的纯净文本中每次出现都触发（长文可能多次提及）
+        for ((kw, cands) in pool) {
+            var idx = raw.indexOf(kw)
+            while (idx >= 0) {
+                out.add(com.mtts.app.util.TextPreprocessor.SfxAt(
+                    cands[rnd.nextInt(cands.size)], idx.toFloat() / raw.length.coerceAtLeast(1)))
+                idx = raw.indexOf(kw, idx + kw.length)
+            }
+        }
+        return out.sortedBy { it.at }
+    }
+
+    /** PCM16 小端 ByteArray → ShortArray */
+    private fun bytesToShorts(b: ByteArray): ShortArray {
+        val bb = java.nio.ByteBuffer.wrap(b).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        val s = ShortArray(b.size / 2)
+        bb.asShortBuffer().get(s)
+        return s
+    }
+
+    /** ShortArray → PCM16 小端 ByteArray */
+    private fun shortsToBytes(s: ShortArray): ByteArray {
+        val bb = java.nio.ByteBuffer.allocate(s.size * 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        bb.asShortBuffer().put(s)
+        return bb.array()
+    }
+
+    /**
      * 将 PCM（16bit / 单声道，srcRateHz 为源采样率）播放。
      *
      * ★ 统一 24kHz 输出：本设备直接建 16kHz AudioTrack 会无声（playbackHeadPosition 冻结、
      *    write 无效），而 24kHz 一直正常。故 16k 数据一律重采样到 24k 再播放，
      *   与 playDialog/系统 TTS 一致——既有声音又不因采样率不匹配而变调/杂音。
      */
-    private fun playPcm(pcm: ByteArray, srcRateHz: Int = 24000) {
+    private fun playPcm(pcm: ByteArray, srcRateHz: Int = 24000, sfxNames: List<com.mtts.app.util.TextPreprocessor.SfxAt> = emptyList()) {
         val playRate = 24000   // 统一输出采样率
-        val raw = if (srcRateHz == playRate || srcRateHz <= 0) pcm
-                  else PcmResampler.resample16BitMono(pcm, srcRateHz, playRate)
+        val raw0 = if (srcRateHz == playRate || srcRateHz <= 0) pcm
+                   else PcmResampler.resample16BitMono(pcm, srcRateHz, playRate)
+        // ★ 音效混音（BGM + sfx 标记），在统一 24kHz PCM 上执行
+        val raw = applySoundFx(raw0, sfxNames)
         if (raw.isEmpty()) return
         val minBuf = AudioTrack.getMinBufferSize(playRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
 
@@ -688,7 +850,7 @@ class MainViewModel : ViewModel() {
         // 分块阻塞写入（data >= minBuf+block → 首次 write 即阻塞，播放线程必然启动）
         var offset = 0
         val writeStart = System.currentTimeMillis()
-        while (offset < data.size && track != null) {
+        while (offset < data.size && track != null && !stopRequested) {
             val len = minOf(blockW, data.size - offset)
             val written = finalTrack.write(data, offset, len)
             if (written <= 0) throw RuntimeException(str(R.string.err_play_failed) + " (write=$written)")
@@ -702,10 +864,15 @@ class MainViewModel : ViewModel() {
         val totalMs = raw.size * 1000L / (playRate * 2L)
         val remainMs = maxOf(0L, totalMs - writeMs) + 250
         val drainDeadline = System.currentTimeMillis() + remainMs
-        while (System.currentTimeMillis() < drainDeadline && track != null) {
+        while (System.currentTimeMillis() < drainDeadline && track != null && !stopRequested) {
             val head = try { finalTrack.playbackHeadPosition.toLong() } catch (_: Throwable) { -1L }
             if (head >= totalSamples) break
             try { Thread.sleep(30) } catch (_: Throwable) {}
+        }
+        // 被停止时立即静音（不等异步 release），避免残留一两秒尾音
+        if (stopRequested || track == null) {
+            try { finalTrack.pause() } catch (_: Throwable) {}
+            try { finalTrack.flush() } catch (_: Throwable) {}
         }
         MttsLog.d("Vm", "drain done totalSamples=$totalSamples remainMs=$remainMs")
         try { finalTrack.stop() } catch (_: Throwable) {}
@@ -747,14 +914,17 @@ class MainViewModel : ViewModel() {
                     val silenceMs = pauses.sum()
                     val silence = if (silenceMs > 0) ByteArray(rate * 2 * silenceMs / 1000) else ByteArray(0)
                     val full = if (silence.isEmpty()) balanced
-                               else balanced + silence
+                           else balanced + silence
                     // ★ 用音色真实采样率播放（搜狗/百度 16kHz、微软 24kHz）
-                    playPcm(full, rate)
+                    startBgmLoop()
+                    playPcm(full, rate, effectiveSfxAt(t))
                 }
+                stopBgmLoop()
                 _uiState.value = _uiState.value.copy(playing = false, synthesizing = false)
             } catch (e: Exception) {
                 MttsLog.e("Vm", "playText failed", e)
                 stopPlayback()
+                stopBgmLoop()
                 _uiState.value = _uiState.value.copy(
                     playing = false, synthesizing = false,
                     error = e.message ?: str(R.string.err_play_failed)
@@ -910,6 +1080,8 @@ class MainViewModel : ViewModel() {
 
         MttsLog.d("Dialog", "play start", mapOf("lines" to parsed.size, "roles" to roles.size))
         _dialog.value = state.copy(playing = true, error = null, progressLine = -1)
+        // ★ 新播放会话开始：清掉上一次 stop 残留的标志（此处 playing=false，无并发 worker 竞争）
+        stopRequested = false
 
         // ★ 对话句间隔：本句单独间隔 > 角色默认间隔 > 全局默认（毫秒）
         val defaultIntervalMs = AppPrefs.getDialogIntervalMs().coerceIn(0, 10000)
@@ -917,9 +1089,13 @@ class MainViewModel : ViewModel() {
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
                 try {
+                    // ★ 启动常驻 BGM 循环（与语音轨道并行，句间等待也连续）
+                    startBgmLoop()
                     // 逐行合成并立即播放，进度行与实际发声严格同步。
-                    stopRequested = false
+                    // ★ stopRequested 不在此重置：若用户在进入循环前就按了 stop，此处重置会吞掉请求
                     for (i in parsed.indices) {
+                        // 循环开头即检查 stop，避免停后仍合成/播出下一句
+                        if (stopRequested) break
                         val line = parsed[i]
                         val role = roleMap[line.roleLabel] ?: continue
                         // 禁言群员：跳过合成（不发声）
@@ -964,9 +1140,8 @@ class MainViewModel : ViewModel() {
                         // 标记当前播放行（与实际发声同步）
                         _dialog.value = _dialog.value.copy(progressLine = i)
                         // 阻塞播放该行直到播完（stopDialog 置 stopRequested=true 打断等待）
-                        playPcm(pcm, playRate)
-                        // ★ 句间隔：本句播完后停顿再播下一句（可被停止打断）
-                        //   优先级：本句单独间隔(>0) > 全局默认间隔
+                        playPcm(pcm, playRate, effectiveSfxAt(cleanText))
+                        // ★ 句间隔：直接 sleep 等待（BGM 由独立 MediaPlayer 播放，天然连续）
                         val lineInterval = AppPrefs.getLineIntervalMs(line.text).coerceIn(0, 10000)
                         val intervalMs = if (lineInterval > 0) lineInterval else defaultIntervalMs
                         if (intervalMs > 0 && i < parsed.size - 1) {
@@ -987,6 +1162,7 @@ class MainViewModel : ViewModel() {
                 }
             }
             stopRequested = false
+            stopBgmLoop()
             _dialog.value = _dialog.value.copy(playing = false, progressLine = -1)
         }
     }
@@ -994,13 +1170,17 @@ class MainViewModel : ViewModel() {
     /** 停止对话播放 */
     fun stopDialog() {
         stopRequested = true
+        stopBgmLoop()
+        // ★ 同步立即静音当前 track（pause+flush），release 留异步——
+        //   否则异步窗口内 playPcm 的阻塞 write 还能继续喂入 1~2 秒尾音
+        val t = track
+        try { t?.pause() } catch (_: Throwable) {}
+        try { t?.flush() } catch (_: Throwable) {}
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
-                try { track?.pause() } catch (_: Throwable) {}
-                try { track?.flush() } catch (_: Throwable) {}
-                try { track?.release() } catch (_: Throwable) {}
-                track = null
+                try { t?.release() } catch (_: Throwable) {}
             }
+            track = null
             _dialog.value = _dialog.value.copy(playing = false)
         }
     }
@@ -1027,6 +1207,7 @@ class MainViewModel : ViewModel() {
         try { track?.pause() } catch (_: Throwable) {}
         try { track?.release() } catch (_: Throwable) {}
         track = null
+        stopBgmLoop()
         super.onCleared()
     }
 }

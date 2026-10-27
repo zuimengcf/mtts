@@ -48,6 +48,7 @@ fun Context.settingsTitle(item: SettingsItem): String = when (item) {
     SettingsItem.TEST_TEXT -> getString(R.string.set_test_text)
     SettingsItem.LOGS -> getString(R.string.set_logs)
     SettingsItem.HTTP_SERVER -> getString(R.string.set_http_server)
+    SettingsItem.SOUND_FX -> "音效"
     SettingsItem.PREPROCESS -> getString(R.string.set_preprocess)
     SettingsItem.SETTINGS_IO -> "全局设置导入导出"
     SettingsItem.DIALOG_FEATURE -> "对话功能"
@@ -62,6 +63,7 @@ fun Context.settingsDesc(item: SettingsItem): String = when (item) {
     SettingsItem.TEST_TEXT -> getString(R.string.set_test_text_desc)
     SettingsItem.LOGS -> getString(R.string.set_logs_desc)
     SettingsItem.HTTP_SERVER -> getString(R.string.set_http_server_desc)
+    SettingsItem.SOUND_FX -> "背景音乐 BGM / 短音效触发"
     SettingsItem.PREPROCESS -> getString(R.string.set_preprocess_desc)
     SettingsItem.SETTINGS_IO -> "除语音包外的全部设置一键导入 / 导出"
     SettingsItem.DIALOG_FEATURE -> "旁白 / 角色 / 声音分组 / 情感"

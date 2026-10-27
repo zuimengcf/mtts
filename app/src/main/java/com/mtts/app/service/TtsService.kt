@@ -24,6 +24,7 @@ import com.mtts.app.util.MttsLog
 import com.mtts.app.util.PcmResampler
 import com.mtts.app.util.TextPreprocessor
 import com.mtts.app.util.AppPrefs
+import com.mtts.app.util.SoundEffectManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import java.util.Locale
@@ -61,6 +62,11 @@ class TtsService : TextToSpeechService() {
     // 停止标记：外部 App 停止朗读/翻页（onStop）后置 true，当前任务在段边界快速退出
     @Volatile
     private var stoppedFlag = false
+
+    // ★ 段合成共享线程池（原每段新建 SingleThreadExecutor 且不关闭 → 线程泄漏）
+    private val synthPool = java.util.concurrent.Executors.newFixedThreadPool(2) { r ->
+        Thread(r, "mtts-seg-synth").apply { isDaemon = true }
+    }
     // ★ 代际号：onStop() 递增。每个任务捕获自己启动时的代际，写块/段边界校验代际未变，
     //   彻底封死"旧任务卡在段内合成、新请求已把 stoppedFlag 复位"的竞态 → 关闭后不再继续朗读。
     @Volatile
@@ -69,6 +75,51 @@ class TtsService : TextToSpeechService() {
     // ★ 发热修复：WakeLock 按需获取（合成开始 acquire、完成/停止/异常 release）。
     //   WifiLock 已移除：所有引擎均为离线引擎，合成不需要网络，WiFi 锁纯属白白阻止 WiFi 休眠。
     private var wakeLock: PowerManager.WakeLock? = null
+
+    // ★ BGM：独立 MediaPlayer（与语音 PCM 管线解耦，系统混音器并行输出）。
+    //   原逐句 PCM 混入方案会在首段混音时同步整首解码（44.1kHz 源可拖 18 秒+），
+    //   直接卡死输出线程 → 外部调用第一句长时间无声。
+    @Volatile
+    private var bgmPlayer: android.media.MediaPlayer? = null
+
+    /** 启动独立 BGM 播放（已在播则复用，不重启——外部朗读每句一次请求，跨句必须连续） */
+    private fun startBgmPlayer() {
+        if (!AppPrefs.isBgmEnabled()) { stopBgmPlayer(); return }
+        val path = AppPrefs.getBgmPath()
+        if (path.isBlank()) { stopBgmPlayer(); return }
+        // 已在播放且文件未变 → 直接复用
+        bgmPlayer?.let { return }
+        try {
+            val mp = android.media.MediaPlayer()
+            mp.setDataSource(path)
+            mp.setAudioAttributes(
+                android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            mp.isLooping = true
+            val vol = AppPrefs.getBgmVolume()
+            mp.setVolume(vol, vol)
+            mp.prepare()
+            mp.start()
+            bgmPlayer = mp
+            MttsLog.d(TAG, "bgm player start $path")
+        } catch (t: Throwable) {
+            MttsLog.e(TAG, "bgm player failed: ${t.message}")
+            try { bgmPlayer?.release() } catch (_: Throwable) {}
+            bgmPlayer = null
+        }
+    }
+
+    /** 停止并释放独立 BGM 播放 */
+    private fun stopBgmPlayer() {
+        val mp = bgmPlayer ?: return
+        bgmPlayer = null
+        try { mp.stop() } catch (_: Throwable) {}
+        try { mp.release() } catch (_: Throwable) {}
+        MttsLog.d(TAG, "bgm player stop")
+    }
 
     companion object {
         private const val CHANNEL_ID = "mtts_tts_service"
@@ -112,6 +163,21 @@ class TtsService : TextToSpeechService() {
         if (ms <= 0) return ByteArray(0)
         val bytes = (24000 * 2 * ms / 1000).coerceAtLeast(0)
         return ByteArray(bytes) // 全 0 = 静音
+    }
+
+    /** PCM16 小端 ByteArray → ShortArray（混音用） */
+    private fun ByteArrayToShorts(b: ByteArray): ShortArray {
+        val bb = java.nio.ByteBuffer.wrap(b).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        val s = ShortArray(b.size / 2)
+        bb.asShortBuffer().get(s)
+        return s
+    }
+
+    /** ShortArray → PCM16 小端 ByteArray */
+    private fun ShortsToBytes(s: ShortArray): ByteArray {
+        val bb = java.nio.ByteBuffer.allocate(s.size * 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        bb.asShortBuffer().put(s)
+        return bb.array()
     }
 
     /** 引擎默认合成采样率（微软 24k / 搜狗 16k / 其余按缓存首音色，缺省 24k）——兜底用 */
@@ -245,6 +311,8 @@ class TtsService : TextToSpeechService() {
         try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
         // 释放串行合成队列（允许正在执行的任务自然完成，丢弃排队中的新任务）
         synthExecutor.shutdown()
+        synthPool.shutdownNow()
+        stopBgmPlayer()
         super.onDestroy()
     }
 
@@ -388,14 +456,24 @@ class TtsService : TextToSpeechService() {
 
         synthExecutor.execute {
             var started = false
+            var bgmHadError = false
             // ★ 每个请求分配唯一序号 #N，贯穿本章内所有日志，便于按请求追踪生命周期
             val reqNo = reqCounter.incrementAndGet()
+            // ★ 音效：同步最新配置到 SoundEffectManager（BGM/音效开关、音量、注册表）
+            SoundEffectManager.bgmEnabled = AppPrefs.isBgmEnabled()
+            SoundEffectManager.bgmPath = AppPrefs.getBgmPath()
+            SoundEffectManager.bgmVolume = AppPrefs.getBgmVolume()
+            SoundEffectManager.sfxEnabled = AppPrefs.isSfxEnabled()
+            SoundEffectManager.sfxVolume = AppPrefs.getSfxVolume()
+            SoundEffectManager.sfxMap = AppPrefs.loadSfxMap().toMap()
             // ★ 捕获当前代际：此代际内 stoppedFlag 复位/停都不影响本请求继续（除非代际被 onStop 递增）
             val myGen = generation
             // ★ 新请求入队执行：复位停止标记（onStop 后新队列的第一个任务必须是"可继续"状态）
             stoppedFlag = false
             // ★ 发热修复：按需获取 WakeLock，合成完即释放，不长期占锁
             acquireLocks()
+            // ★ BGM：请求开始即启动独立播放器（prepare 在后台队列线程做，不卡框架）
+            startBgmPlayer()
             try {
                 // ★ 延时路由 + 预处理全部移到工作线程（框架线程已立即返回，不再阻塞）
                 // 系统语速：仅当"使用外部参数"开关打开时才采用。此时按 ColorOS/OPPO 中间刻度归一：
@@ -436,7 +514,26 @@ class TtsService : TextToSpeechService() {
                 // ★ 接受小说/任意文本：预处理（文字替换/多音字）+ 对话功能分段（全部走缓存音色）
                 val txt = rawText
                 val result = TextPreprocessor.process(txt)
-                val text = result.text.ifBlank { txt }
+                // ★ 音效：关键词触发 → 自动注入 ⟨sfx:名字⟩ 标记（在关键词处）
+                val text0 = result.text
+                val text = if (AppPrefs.isSfxEnabled()) {
+                    var t = text0
+                    val rnd = java.util.Random()
+                    // 关键词 → 候选池（同名关键词可能对应多个音效），随机选一个，不锁死同一个声音
+                    val pool = HashMap<String, MutableList<String>>()
+                    for ((kw, name) in AppPrefs.loadSfxKeywords()) {
+                        if (kw.isNotBlank() && SoundEffectManager.sfxMap.containsKey(name)) {
+                            pool.getOrPut(kw) { mutableListOf() }.add(name)
+                        }
+                    }
+                    for ((kw, cands) in pool) {
+                        if (t.contains(kw)) {
+                            val name = cands[rnd.nextInt(cands.size)]
+                            t = t.replace(kw, kw + TextPreprocessor.SFX_PREFIX + name + TextPreprocessor.SFX_SUFFIX)
+                        }
+                    }
+                    t
+                } else text0
                 val dialogSegs = com.mtts.app.util.DialogFeature.process(text, { ec ->
                     val eng = EngineRegistry.get(ec)
                     if (eng != null) com.mtts.app.util.TtsVoicesCache.get(eng) else emptyList()
@@ -513,6 +610,7 @@ class TtsService : TextToSpeechService() {
                         continue
                     }
 
+
                     val segEngine = EngineRegistry.get(seg.engineCode) ?: engineForJob
                     val segVoice = seg.voice.ifBlank {
                         com.mtts.app.util.TtsVoicesCache.get(segEngine).firstOrNull()?.shortName ?: finalVoice
@@ -521,23 +619,48 @@ class TtsService : TextToSpeechService() {
                     val segVolume = (finalVolume * seg.volume * volMark).coerceIn(0f, 2f)
                     val segPitch = (finalPitch + seg.pitch + pitMark).coerceIn(-1f, 1f)
 
+                    // ★ 首字提速：进入段循环即调用 callback.start()，让系统 TTS 框架的播放器
+                    //   提前就绪，段音频一合成完立即开播（原来要等首段合成完才 start，
+                    //   框架内部还要再缓冲，首字延迟 = 合成时间 + 框架启动时间）
+                    if (!started) {
+                        if (callback.start(24000, AudioFormat.ENCODING_PCM_16BIT, 1) == TextToSpeech.SUCCESS) {
+                            started = true
+                        }
+                    }
+
                     MttsLog.d(TAG, "REQ #$reqNo seg[${idx + 1}/${dialogue.size}] ${if (seg.isSpeech) "对白" else "旁白"} " +
                             "speaker=${seg.speaker}  eng=${segEngine.code}:$segVoice  " +
                             "speed=${"%.2f".format(segSpeed)} vol=${"%.2f".format(segVolume)} pitch=${"%.2f".format(segPitch)}  " +
                             "text=\"${cleanText.take(24)}\"")
 
-                    val segPcm = runBlocking(Dispatchers.IO) {
+                    // ★ 停止秒断：合成用 Future 包裹，停止时不再干等当前段合成完（原 runBlocking 会阻塞到合成结束，
+                    //   微软引擎一段要 1~2s，stop 后"还在念"的残留全来自这里）。
+                    // ★ 复用共享线程池（原每段 newSingleThreadExecutor 不关闭 → 长时间朗读线程泄漏）
+                    val synthFuture = java.util.concurrent.CompletableFuture.supplyAsync({
                         try {
-                            // ★ 音量均衡：引擎始终传 volume=1.0 拿"基准声"，
-                            //   再由 balanceVolume16BitMono 做峰值归一化到统一听感。
-                            //   这样各引擎在 UI 50 (volume=1.0) 下音量一致。
-                            segEngine.synthesize(cleanText, segVoice, segSpeed, 1.0f, segPitch)
+                            // 合成在后台线程跑，外层主队列轮询停止标志；停止时不再干等本段完成
+                            runBlocking { segEngine.synthesize(cleanText, segVoice, segSpeed, 1.0f, segPitch) }
                         } catch (ex: Exception) {
-                            // ★ 单段失败（例如纯标点/破折号被引擎拒绝）不中断整个流程，
-                            //   记录后跳过该段，继续后续段落。
                             MttsLog.w(TAG, "REQ #$reqNo seg[${idx + 1}] ✗ 合成失败跳过: ${ex.message}")
                             ByteArray(0)
                         }
+                    }, synthPool)
+                    var segPcm: ByteArray
+                    while (true) {
+                        if (stoppedFlag || generation != myGen) {
+                            // 已被停止：取消合成并立即退出本段（后台合成线程随后自然结束）
+                            synthFuture.cancel(true)
+                            MttsLog.w(TAG, "REQ #$reqNo ⏹ 合成等待中断（停止）")
+                            return@execute
+                        }
+                        segPcm = try {
+                            synthFuture.get(100, java.util.concurrent.TimeUnit.MILLISECONDS)
+                        } catch (e: java.util.concurrent.TimeoutException) {
+                            continue
+                        } catch (e: Exception) {
+                            ByteArray(0)
+                        }
+                        break
                     }
                     if (segPcm.isEmpty()) {
                         // 空段：跳过音频但仍追加停顿静音（保持语流节奏）
@@ -551,10 +674,36 @@ class TtsService : TextToSpeechService() {
                     // ★ 取「当前音色」的采样率（百度不同音色采样率不同，见 voiceSampleRate 注释），
                     //   避免误判跳过重采样导致杂音。
                     val segRate = voiceSampleRate(segEngine, segVoice)
-                    val unifiedSeg = if (segRate == 24000) segPcm
+                    var unifiedSeg = if (segRate == 24000) segPcm
                                      else PcmResampler.resample16BitMono(segPcm, segRate, 24000)
                     // ★ 峰值归一化音量均衡（在统一采样率后做）
-                    val balanced = PcmResampler.balanceVolume16BitMono(unifiedSeg, segVolume)
+                    val balanced0 = PcmResampler.balanceVolume16BitMono(unifiedSeg, segVolume)
+
+                                        // ★★ 音效混音（PCM 层）：BGM 已改为独立 MediaPlayer（见 startBgmPlayer），不再逐句 PCM 混入。
+                    //   （原混入方案首段同步整首解码 44.1kHz BGM，卡输出线程 18 秒+ → 外部调用第一句"卡死"）
+                    //   此处只保留段内 ⟨sfx:名⟩ 短音效混入。
+                    val balanced = run {
+                        var pcmBytes = balanced0
+                        // 音效标记：段内 ⟨sfx:名⟩ → 在对应样本位置混入
+                        if (AppPrefs.isSfxEnabled()) {
+                            val sfxItems = TextPreprocessor.extractSfxAt(seg.text)
+                            if (sfxItems.isNotEmpty()) {
+                                var samples = ByteArrayToShorts(pcmBytes)
+                                for (item in sfxItems) {
+                                    val sfx = SoundEffectManager.getSfxPcm(this@TtsService, item.name)
+                                    if (sfx != null) {
+                                        // ★ 按标记在文本中的位置比例映射到 PCM（回退 0.2s 对齐开口瞬间）
+                                        val at = ((samples.size - 1) * item.at - 4800).toInt()
+                                            .coerceIn(0, samples.size - 1)
+                                        // mixSfx 返回混合后的新数组，直接替换引用
+                                        samples = SoundEffectManager.mixSfx(samples, at, sfx, SoundEffectManager.sfxVolume)
+                                    }
+                                }
+                                pcmBytes = ShortsToBytes(samples)
+                            }
+                        }
+                        pcmBytes
+                    }
                     if (!writeChunk(balanced, 0, balanced.size)) return@execute
                     // 追加停顿静音
                     for (ms in pauses) {
@@ -572,9 +721,11 @@ class TtsService : TextToSpeechService() {
                 }
                 MttsLog.i(TAG, "REQ #$reqNo done  bytes=$totalBytes  " +
                         "dur=${totalBytes * 1000L / (24000 * 2L)}ms  voice=${engineForJob.code}:$finalVoice")
+                // ★ 请求正常完成：BGM 保持播放（外部朗读每句一次请求，跨句必须连续）
                 callback.done()
             } catch (e: Exception) {
                 MttsLog.e(TAG, "REQ #$reqNo ✗ 异常终止: ${e.message ?: "exception"} [$rawText]", e)
+                bgmHadError = true
                 try {
                     // ★ 已 start 过就不能再 start（会异常）；直接 done 收尾
                     if (started) {
@@ -585,6 +736,9 @@ class TtsService : TextToSpeechService() {
                 } catch (_: Throwable) {}
             } finally {
                 // ★ 发热修复：合成完成/异常/停止后立即释放锁，不长期占用
+                // ★ finally 里的 BGM 停止只针对异常路径无法区分——改为：仅当异常时才停。
+                //   正常完成后 BGM 继续播（跨句连续）。
+                if (bgmHadError) stopBgmPlayer()
                 releaseLocks()
             }
         }
@@ -605,6 +759,8 @@ class TtsService : TextToSpeechService() {
         // ★ 代际递增：令所有已入队/正在执行的旧任务（含卡在段内合成的）在段边界/块级感知被废弃，
         //   即使随后新请求复位 stoppedFlag，旧任务也能通过 generation != myGen 快速退出，不再继续朗读。
         generation++
+        // ★ 外部停止：立即停 BGM
+        stopBgmPlayer()
         // ★ 发热修复：外部停止时立即释放锁
         releaseLocks()
         val old = synthExecutor

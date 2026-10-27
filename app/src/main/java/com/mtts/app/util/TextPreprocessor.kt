@@ -47,13 +47,13 @@ object TextPreprocessor {
     private const val PAD1 = '\u0001'
     private const val PAD2 = '\u0002'
 
-    /** 匹配所有已注入标记（pause/vol/pit），供「标记保护」占位使用 */
+    /** 匹配所有已注入标记（pause/vol/pit/sfx），供「标记保护」占位使用 */
     private val MARKER_ANY_RE =
-        Regex("""\u27E8(?:pause:\d+|vol:[\d.]+|pit:[-\d.]+)\u27E9""")
+        Regex("""\u27E8(?:pause:\d+|vol:[\d.]+|pit:[-\d.]+|sfx:[^⟩\u0000-\u001f]{1,32})\u27E9""")
 
     /** 兜底清理畸形残缺标记：缺冒号（⟨pause400⟩）、空（⟨pause⟩）、内容非法等 */
     private val MARKER_BROKEN_RE =
-        Regex("""\u27E8\s*(?:pause|vol|pit)\s*[^⟩\u0000-\u001f]{0,12}\s*\u27E9""", RegexOption.IGNORE_CASE)
+        Regex("""\u27E8\s*(?:pause|vol|pit|sfx)\s*[^⟩\u0000-\u001f]{0,12}\s*\u27E9""", RegexOption.IGNORE_CASE)
 
     /** 保护已注入标记：把每个标记替换成 \u0001+序号+\u0002 占位符（不会被后续正则命中）。
      *  序号写入 stored（累加），从 1 起与 pad1 后的数字对应；process 流水线每步都调用本函数，
@@ -82,6 +82,14 @@ object TextPreprocessor {
     const val PIT_PREFIX = "\u27E8pit:"
     const val PIT_SUFFIX = "\u27E9"
     private val PIT_RE = Regex("""\u27E8pit:([-\d.]+)\u27E9""")
+
+    /**
+     * 音效标记：格式 ⟨sfx:名字⟩。合成阶段识别 → 在当前位置混入对应音效。
+     * 名字由「音效设置页」注册（标记名 → 音频文件）。
+     */
+    const val SFX_PREFIX = "\u27E8sfx:"
+    const val SFX_SUFFIX = "\u27E9"
+    private val SFX_RE = Regex("""\u27E8sfx:([^⟩\u0000-\u001f]{1,32})\u27E9""")
 
     /** 单条替换规则（对齐 MultiTTS ReplaceConfig + 新增 pauseMs 字段） */
     data class ReplaceRule(
@@ -1220,13 +1228,35 @@ object TextPreprocessor {
         return all.lastOrNull() ?: 0f
     }
 
+    /**
+     * 提取音效标记（按出现顺序；每个标记 → 音效名）。
+     * 供 TtsService 合成时在段首混入对应音效。
+     */
+    fun extractSfx(text: String): List<String> {
+        return SFX_RE.findAll(text).map { it.groupValues[1].trim() }.filter { it.isNotEmpty() }.toList()
+    }
+
+    /**
+     * 提取音效标记 + 相对位置（0f..1f，标记起点占全文比例）。
+     * 供混音时把音效对齐到关键词被朗读的位置（而非段首）。
+     */
+    data class SfxAt(val name: String, val at: Float)
+
+    fun extractSfxAt(text: String): List<SfxAt> {
+        val len = text.length.coerceAtLeast(1)
+        return SFX_RE.findAll(text).mapNotNull { m ->
+            val name = m.groupValues[1].trim()
+            if (name.isEmpty()) null else SfxAt(name, m.range.first.toFloat() / len)
+        }.toList()
+    }
+
     /** 剥离全部标记（停顿/音量/音调），返回纯净文本。
      *  ★ 兜底清理：除了标准 ⟨pause:ms⟩/⟨vol:x⟩/⟨pit:x⟩，也清掉畸形残缺标记
      *  （如 ⟨pause400⟩ 缺冒号、⟨pause⟩ 空、⟨pause:150⟩ 内部被破坏等），
      *  防止历史 bug 或用户误操作遗留的畸形标记被引擎当普通文本朗读
      *  （历史上曾产生「200400」这种被朗读的数字）。 */
     fun stripAllMarkers(text: String): String {
-        var out = text.replace(PAUSE_RE, "").replace(VOL_RE, "").replace(PIT_RE, "")
+        var out = text.replace(PAUSE_RE, "").replace(VOL_RE, "").replace(PIT_RE, "").replace(SFX_RE, "")
         // 再清扫任何残缺/畸形标记（⟨pause400⟩/⟨pit⟩/⟨vol1.5⟩ 等），确保不残留可朗读字符
         out = MARKER_BROKEN_RE.replace(out, "")
         return out

@@ -4,6 +4,7 @@ import android.app.Application
 import com.mtts.app.engine.EngineRegistry
 import com.mtts.app.engine.VoicePackageManager
 import com.mtts.app.server.LocalHttpServer
+import com.mtts.app.util.AppPrefs
 import com.mtts.app.util.CrashLogger
 import com.mtts.app.util.FileLog
 import com.mtts.app.util.MttsLog
@@ -37,6 +38,10 @@ class MttsApplication : Application() {
         // 将 assets 内置语音包解压到 Android/data 私有目录（后台线程，避免阻塞主线程导致 ANR）
         Thread {
             VoicePackageManager.unpackAssets(this)
+            // 内置示例音效（雨/雷/脚步/狗叫/敲门）：解压到私有目录并注册，只补缺
+            try { AppPrefs.ensureBuiltinSfxImported() } catch (t: Throwable) {
+                MttsLog.w("App", "builtin sfx import failed: ${t.message}")
+            }
             MttsLog.d("App", "voice assets unpacked")
         }.apply {
             name = "voice-unpack"

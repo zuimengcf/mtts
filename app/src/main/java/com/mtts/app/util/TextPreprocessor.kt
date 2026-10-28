@@ -824,7 +824,7 @@ object TextPreprocessor {
     // ---------- 内置小规则（保底，仅当语音包无 replaces.yaml 时兜底常见符号） ----------
 
     private fun builtinRules(): List<ReplaceRule> = listOf(
-        ReplaceRule(name = "省略号→停顿", regex = true, source = "(…+|\\\\.{3,6})", target = " ——"),
+        ReplaceRule(name = "省略号→停顿", regex = true, source = "(…+|\\.{3,6})", target = " ——"),
         ReplaceRule(name = "竖线→消音", regex = true, source = "(?<!\\d)\\|(?!\\d)", target = ""),
         ReplaceRule(name = "等于→等于", regex = true, source = "(?<=[0-9a-zA-Z])=(?=[0-9a-zA-Z])", target = "等于"),
         ReplaceRule(name = "乘号→乘", regex = true, source = "[ꁘ*＊Xx×](?=\\d)", target = "乘"),

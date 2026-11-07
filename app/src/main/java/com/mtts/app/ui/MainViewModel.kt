@@ -154,6 +154,68 @@ class MainViewModel : ViewModel() {
     /** 播放停止请求标志（stopDialog 置 true 打断逐行播放循环） */
     @Volatile private var stopRequested = false
 
+    // ---------------- 音效误触发抑制 ----------------
+    // 反屏蔽词清单已持久化到 AppPrefs（设置页可增删改、首启播种默认值），此处不再硬编码
+    // 单字关键词命中后真正触发的概率（低概率抑制误触发）
+    private val SFX_SINGLE_CHAR_PROB = 0.35f
+    // 多字关键词命中后真正触发的概率（也加随机概率，避免长文里「脚步」出现5次响5次）
+    private val SFX_MULTI_CHAR_PROB = 0.65f
+    // 同一音效的重复抑制窗口（毫秒）：短时间不重复响
+    private val SFX_REPEAT_WINDOW_MS = 4000L
+    // 同一关键词的重复抑制窗口（毫秒）：防止一个词在文中反复出现时连响
+    private val SFX_KW_REPEAT_WINDOW_MS = 6000L
+    // 记录各音效名最近一次触发的时间戳（elapsedRealtime）
+    private val lastSfxPlayAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    // 记录各关键词最近一次触发的时间戳（elapsedRealtime）
+    private val lastKwTriggerAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    // ★ 音效配置内存缓存：避免每次 effectiveSfxAt/effectiveSfxNames/isInBlockedWord 都读 SharedPreferences
+    @Volatile private var sfxBlockedWordsCache: List<String>? = null
+    @Volatile private var sfxMapCache: Map<String, String>? = null
+    @Volatile private var sfxKeywordsCache: List<Pair<String, String>>? = null
+    private val sfxCacheLock = Any()
+    // ★ 共享 Random 实例，避免每次调用 effectiveSfx* 都 new 一个
+    private val sharedRandom = java.util.Random()
+
+    /** 获取反屏蔽词（内存缓存，首次或缓存失效时读 SP） */
+    private fun cachedBlockedWords(): List<String> {
+        sfxBlockedWordsCache?.let { return it }
+        synchronized(sfxCacheLock) {
+            sfxBlockedWordsCache?.let { return it }
+            val v = com.mtts.app.util.AppPrefs.loadSfxBlockedWords()
+            sfxBlockedWordsCache = v
+            return v
+        }
+    }
+    /** 获取音效注册表（内存缓存） */
+    private fun cachedSfxMap(): Map<String, String> {
+        sfxMapCache?.let { return it }
+        synchronized(sfxCacheLock) {
+            sfxMapCache?.let { return it }
+            val v = com.mtts.app.util.AppPrefs.loadSfxMap().toMap()
+            sfxMapCache = v
+            return v
+        }
+    }
+    /** 获取关键词列表（内存缓存） */
+    private fun cachedSfxKeywords(): List<Pair<String, String>> {
+        sfxKeywordsCache?.let { return it }
+        synchronized(sfxCacheLock) {
+            sfxKeywordsCache?.let { return it }
+            val v = com.mtts.app.util.AppPrefs.loadSfxKeywords()
+            sfxKeywordsCache = v
+            return v
+        }
+    }
+    /** 使音效配置缓存失效（设置页修改后调用） */
+    fun invalidateSfxCache() {
+        synchronized(sfxCacheLock) {
+            sfxBlockedWordsCache = null
+            sfxMapCache = null
+            sfxKeywordsCache = null
+        }
+    }
+
     /** 从应用上下文读取字符串资源（ViewModel 层） */
     private fun str(id: Int): String =
         MttsApplication.ctx()?.getString(id) ?: ""
@@ -360,7 +422,7 @@ class MainViewModel : ViewModel() {
                 val effVol = (vol * volMark).coerceIn(0f, 2f)
                 val effPit = (pit + pitMark).coerceIn(-1f, 1f)
                 var audio = withContext(Dispatchers.IO) {
-                    engine.synthesize(clean, voice, spd, 1.0f, effPit)
+                    synthesizeWithTimeout(engine, voice, spd, 1.0f, effPit, clean)
                 }
                 // ★ 峰值归一化音量均衡
                 audio = PcmResampler.balanceVolume16BitMono(audio, effVol)
@@ -386,6 +448,42 @@ class MainViewModel : ViewModel() {
                     audioReady = false
                 )
             }
+        }
+    }
+
+    // ---------------- 合成卡死保护 ----------------
+    // ★ engine.synthesize 是无超时阻塞调用（微软 get() / 搜狗百度网络请求 / sherpa 模型），
+    //   一旦内部挂起 → 播放协程永远卡住 → stop 失效、BGM 照常播（用户报告的「朗读卡死」）。
+    //   用独立线程 + Future.get(timeout) 做超时兜底：超时后 abandon 该线程，主流程继续报错。
+    @Volatile private var synthWatchdogRunning = false
+
+    /** 带超时保护的合成（60s 兜底） */
+    private fun synthesizeWithTimeout(
+        engine: TtsEngine, voice: String, spd: Float, vol: Float, pit: Float, text: String
+    ): ByteArray {
+        if (synthWatchdogRunning) {
+            throw RuntimeException(str(R.string.err_synth_failed) + " (前一次合成仍在挂起，已拦截)")
+        }
+        synthWatchdogRunning = true
+        try {
+            val executor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+                Thread(r, "mtts-synth-watchdog").apply { isDaemon = true }
+            }
+            val future = executor.submit(java.util.concurrent.Callable {
+                kotlinx.coroutines.runBlocking {
+                    engine.synthesize(text, voice, spd, vol, pit)
+                }
+            })
+            return try {
+                future.get(60, java.util.concurrent.TimeUnit.SECONDS)
+            } catch (te: java.util.concurrent.TimeoutException) {
+                future.cancel(true)
+                throw RuntimeException(str(R.string.err_synth_failed) + " (合成超时 60s，引擎可能已挂起)")
+            } finally {
+                executor.shutdownNow()
+            }
+        } finally {
+            synthWatchdogRunning = false
         }
     }
 
@@ -429,7 +527,7 @@ class MainViewModel : ViewModel() {
                     val clean = TextPreprocessor.stripAllMarkers(text)
                     val effVol = (vol * volMark).coerceIn(0f, 2f)
                     val effPit = (pit + pitMark).coerceIn(-1f, 1f)
-                    var pcm = engine.synthesize(clean, voice, spd, 1.0f, effPit)
+                    var pcm = synthesizeWithTimeout(engine, voice, spd, 1.0f, effPit, clean)
                     if (pcm.isEmpty()) throw RuntimeException(str(R.string.err_no_audio))
                     // ★ 峰值归一化音量均衡（保证各引擎在相同 UI 音量下听感一致）
                     pcm = PcmResampler.balanceVolume16BitMono(pcm, effVol)
@@ -450,13 +548,19 @@ class MainViewModel : ViewModel() {
                 stopBgmLoop()
                 _uiState.value = _uiState.value.copy(playing = false, synthesizing = false)
             } catch (e: Exception) {
-                MttsLog.e("Vm", "play failed", e)
-                stopPlayback()
-                stopBgmLoop()
-                _uiState.value = _uiState.value.copy(
-                    playing = false, synthesizing = false,
-                    error = e.message ?: str(R.string.err_play_failed)
-                )
+                if (stopRequested) {
+                    // ★ 用户主动停止导致的 write 中断不算错误——静默处理
+                    stopBgmLoop()
+                    _uiState.value = _uiState.value.copy(playing = false, synthesizing = false)
+                } else {
+                    MttsLog.e("Vm", "play failed", e)
+                    stopPlayback()
+                    stopBgmLoop()
+                    _uiState.value = _uiState.value.copy(
+                        playing = false, synthesizing = false,
+                        error = e.message ?: str(R.string.err_play_failed)
+                    )
+                }
             }
         }
     }
@@ -464,6 +568,7 @@ class MainViewModel : ViewModel() {
     /** 停止并释放当前播放 */
     fun stopPlayback() {
         stopRequested = true
+        stopBgmLoop()   // 停止朗读时同步停 BGM，避免语音停了背景音乐还在循环
         val oldTrack = track
         // ★ 同步立即静音，release 异步（与 stopDialog 一致，消除阻塞 write 竞争窗口）
         try { oldTrack?.pause() } catch (_: Throwable) {}
@@ -485,6 +590,7 @@ class MainViewModel : ViewModel() {
      */
     fun reloadAfterSettingsImport() {
         stopRequested = true
+        stopBgmLoop()
         val oldTrack = track
         track = null
         viewModelScope.launch(Dispatchers.IO) {
@@ -594,7 +700,7 @@ class MainViewModel : ViewModel() {
                     val effVol = (vol * volMark).coerceIn(0f, 2f)
                     val effPit = (pit + pitMark).coerceIn(-1f, 1f)
                     // ★ 音量均衡：引擎传 volume=1.0 拿基准声，再按 effVol 峰值归一化
-                    var pcm = engine.synthesize(clean, voice, spd, 1.0f, effPit)
+                    var pcm = synthesizeWithTimeout(engine, voice, spd, 1.0f, effPit, clean)
                     if (pcm.isEmpty()) throw RuntimeException(str(R.string.err_no_audio))
                     // 峰值归一化音量均衡
                     pcm = PcmResampler.balanceVolume16BitMono(pcm, effVol)
@@ -612,13 +718,19 @@ class MainViewModel : ViewModel() {
                 stopBgmLoop()
                 _uiState.value = _uiState.value.copy(playing = false, synthesizing = false)
             } catch (e: Exception) {
-                MttsLog.e("Vm", "preview failed", e)
-                stopPlayback()
-                stopBgmLoop()
-                _uiState.value = _uiState.value.copy(
-                    playing = false, synthesizing = false,
-                    error = e.message ?: str(R.string.err_preview_failed)
-                )
+                if (stopRequested) {
+                    // ★ 用户主动停止导致的 write 中断不算错误——静默处理
+                    stopBgmLoop()
+                    _uiState.value = _uiState.value.copy(playing = false, synthesizing = false)
+                } else {
+                    MttsLog.e("Vm", "preview failed", e)
+                    stopPlayback()
+                    stopBgmLoop()
+                    _uiState.value = _uiState.value.copy(
+                        playing = false, synthesizing = false,
+                        error = e.message ?: str(R.string.err_preview_failed)
+                    )
+                }
             }
         }
     }
@@ -634,9 +746,9 @@ class MainViewModel : ViewModel() {
         com.mtts.app.util.SoundEffectManager.bgmEnabled = AppPrefs.isBgmEnabled()
         com.mtts.app.util.SoundEffectManager.bgmPath = AppPrefs.getBgmPath()
         com.mtts.app.util.SoundEffectManager.bgmVolume = AppPrefs.getBgmVolume()
-        com.mtts.app.util.SoundEffectManager.sfxEnabled = AppPrefs.isSfxEnabled()
+                com.mtts.app.util.SoundEffectManager.sfxEnabled = AppPrefs.isSfxEnabled()
         com.mtts.app.util.SoundEffectManager.sfxVolume = AppPrefs.getSfxVolume()
-        com.mtts.app.util.SoundEffectManager.sfxMap = AppPrefs.loadSfxMap().toMap()
+        com.mtts.app.util.SoundEffectManager.sfxMap = cachedSfxMap()
 
         var bytes = pcm24k
         // ★ BGM 不再逐句混入：改由常驻 BGM AudioTrack 并行循环播放（见 startBgmLoop），
@@ -667,6 +779,7 @@ class MainViewModel : ViewModel() {
     //   语音怎么停顿/合成等待/被停，BGM 都连续不断。
 
     @Volatile private var bgmPlayer: MediaPlayer? = null
+    private val bgmLoopLock = Any()
 
     /** 启动独立 BGM 播放（已启动则忽略；未启用 BGM/未选文件则不启动） */
     private fun startBgmLoop() {
@@ -674,35 +787,68 @@ class MainViewModel : ViewModel() {
         if (!AppPrefs.isBgmEnabled()) return
         val path = AppPrefs.getBgmPath()
         if (path.isBlank()) return
-        stopBgmLoop()   // 先清掉旧的（文件可能已换）
+        // ★ 锁内只做快速引用交换；prepare()/release() 可能耗时数秒（大文件/损坏文件），
+        //   持锁做会让 stopPlayback 在主线程等锁 → 表现为「先卡死、stop 失效」
+                val old = synchronized(bgmLoopLock) {
+            // ★ 已有实例且未停掉 → 复用（每句调用不应重建，重建才是卡死+音量跳变的根源）
+            if (bgmPlayer != null) return
+            val o = bgmPlayer
+            bgmPlayer = null
+            o
+        }
+        if (old != null) {
+            try { old.pause() } catch (_: Throwable) {}
+            try { old.stop() } catch (_: Throwable) {}
+            try { old.release() } catch (_: Throwable) {}
+        }
+        var mp: MediaPlayer? = null
         try {
-            val mp = MediaPlayer()
-            mp.setDataSource(path)
-            mp.setAudioAttributes(
+            val p = MediaPlayer()
+            mp = p
+            p.setDataSource(path)
+            p.setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build())
-            mp.setLooping(true)
-            mp.setVolume(AppPrefs.getBgmVolume(), AppPrefs.getBgmVolume())
-            mp.prepare()
-            mp.start()
-            bgmPlayer = mp
-            MttsLog.d("Vm", "bgm player start $path")
+            p.setLooping(true)
+            p.setVolume(AppPrefs.getBgmVolume(), AppPrefs.getBgmVolume())
+            p.prepare()   // ★ 锁外：可能阻塞数秒
+            p.start()
         } catch (t: Throwable) {
             MttsLog.e("Vm", "bgm player failed: ${t.message}")
-            try { bgmPlayer?.release() } catch (_: Throwable) {}
-            bgmPlayer = null
+            try { mp?.release() } catch (_: Throwable) {}
+            return
+        }
+        // 锁内快速安装（若期间已被 stop 清空且无新实例，则装上；否则丢弃）
+        synchronized(bgmLoopLock) {
+            if (bgmPlayer == null) {
+                bgmPlayer = mp
+                MttsLog.d("Vm", "bgm player start $path")
+            } else {
+                try { mp.release() } catch (_: Throwable) {}
+            }
         }
     }
 
     /** 停止并释放独立 BGM 播放 */
     private fun stopBgmLoop() {
-        val mp = bgmPlayer ?: return
-        bgmPlayer = null
+        // ★ 锁内只摘引用；pause/stop 快，release 可能阻塞 → 锁外做
+        val mp = synchronized(bgmLoopLock) {
+            val m = bgmPlayer
+            bgmPlayer = null
+            m
+        } ?: return
+        try { mp.pause() } catch (_: Throwable) {}   // 先暂停确保音频焦点释放
         try { mp.stop() } catch (_: Throwable) {}
         try { mp.release() } catch (_: Throwable) {}
         MttsLog.d("Vm", "bgm player stop")
+    }
+
+    /** ★ 音量滑块拖动时实时推给正在播放的 BGM（否则要等下次重建才生效，表现为「音量控制不稳定」） */
+    fun updateBgmVolume(v: Float) {
+        val mp = bgmPlayer ?: return
+        try { mp.setVolume(v, v) } catch (_: Throwable) {}
     }
 
     /**
@@ -711,21 +857,18 @@ class MainViewModel : ViewModel() {
      */
     fun effectiveSfxNames(text: String): List<String> {
         if (!AppPrefs.isSfxEnabled()) return emptyList()
-        // 同步注册表
-        com.mtts.app.util.SoundEffectManager.sfxMap = AppPrefs.loadSfxMap().toMap()
+        // 同步注册表（用内存缓存，避免每次都读 SP）
+        val sfxMap = cachedSfxMap()
+        com.mtts.app.util.SoundEffectManager.sfxMap = sfxMap
         val names = TextPreprocessor.extractSfx(text).toMutableList()
         val raw = TextPreprocessor.stripAllMarkers(text)
-        val rnd = java.util.Random()
         val pool = HashMap<String, MutableList<String>>()
-        for ((kw, name) in AppPrefs.loadSfxKeywords()) {
-            if (kw.isNotBlank() &&
-                com.mtts.app.util.SoundEffectManager.sfxMap.containsKey(name)) {
+        for ((kw, name) in cachedSfxKeywords()) {
+            if (kw.isNotBlank() && sfxMap.containsKey(name)) {
                 pool.getOrPut(kw) { mutableListOf() }.add(name)
             }
         }
-        for ((kw, cands) in pool) {
-            if (raw.contains(kw)) names.add(cands[rnd.nextInt(cands.size)])
-        }
+        names.addAll(matchSfxKeywordsByAt(raw, pool, sharedRandom).map { it.name })
         return names
     }
 
@@ -735,27 +878,90 @@ class MainViewModel : ViewModel() {
      */
     fun effectiveSfxAt(text: String): List<com.mtts.app.util.TextPreprocessor.SfxAt> {
         if (!AppPrefs.isSfxEnabled()) return emptyList()
-        com.mtts.app.util.SoundEffectManager.sfxMap = AppPrefs.loadSfxMap().toMap()
+        val sfxMap = cachedSfxMap()
+        com.mtts.app.util.SoundEffectManager.sfxMap = sfxMap
         val out = TextPreprocessor.extractSfxAt(text).toMutableList()
         val raw = TextPreprocessor.stripAllMarkers(text)
-        val rnd = java.util.Random()
         val pool = HashMap<String, MutableList<String>>()
-        for ((kw, name) in AppPrefs.loadSfxKeywords()) {
-            if (kw.isNotBlank() &&
-                com.mtts.app.util.SoundEffectManager.sfxMap.containsKey(name)) {
+        for ((kw, name) in cachedSfxKeywords()) {
+            if (kw.isNotBlank() && sfxMap.containsKey(name)) {
                 pool.getOrPut(kw) { mutableListOf() }.add(name)
             }
         }
-        // 关键词在剥离标记后的纯净文本中每次出现都触发（长文可能多次提及）
-        for ((kw, cands) in pool) {
+        // ★ 关键词自动注入：最长优先 + 字符位置占用，避免单字在多字词里反复误触发
+        out.addAll(matchSfxKeywordsByAt(raw, pool, sharedRandom))
+        return out.sortedBy { it.at }
+    }
+
+    /**
+     * 关键词→音效匹配辅助：对一段纯净文本做「最长优先」匹配，并记录已占用的字符区间；
+     * 已被更长关键词占用过的区间，较短关键词（尤其单字）不再重复触发。
+     *
+     * 例如关键词含「下雨」「雨」：正文「下起雨来」中「下雨」未成词，只有孤立的「雨」命中；
+     * 正文「下雨了」则「下雨」命中并占用 [0,2)，其内的单字「雨」不再单独触发。
+     * 防止单字如「雨」「雷」在「雨水」「雷雨」等词里反复误响。
+     */
+    private fun matchSfxKeywordsByAt(
+        raw: String,
+        pool: Map<String, MutableList<String>>,
+        rnd: java.util.Random
+    ): List<com.mtts.app.util.TextPreprocessor.SfxAt> {
+        val out = ArrayList<com.mtts.app.util.TextPreprocessor.SfxAt>()
+        if (raw.isEmpty() || pool.isEmpty()) return out
+        val len = raw.length
+        // 已占用的字符位：position -> 是否占用（0..len，含末尾哨兵，方便区间长度计算）
+        val occupied = BooleanArray(len + 1)
+        val now = android.os.SystemClock.elapsedRealtime()
+        // 关键词按长度降序，保证最长优先
+        val kws = pool.keys.sortedByDescending { it.length }
+        for (kw in kws) {
+            val cands = pool[kw] ?: continue
+            if (kw.isEmpty()) continue
+            val isSingle = kw.length == 1
+            // ★ 概率判定：所有关键词都走随机概率（单字更严格 0.35，多字 0.65）
+            val triggerProb = if (isSingle) SFX_SINGLE_CHAR_PROB else SFX_MULTI_CHAR_PROB
             var idx = raw.indexOf(kw)
             while (idx >= 0) {
-                out.add(com.mtts.app.util.TextPreprocessor.SfxAt(
-                    cands[rnd.nextInt(cands.size)], idx.toFloat() / raw.length.coerceAtLeast(1)))
+                // 若这个区间尚未被任何更长关键词占用，才触发；否则跳过
+                var free = true
+                for (p in idx until idx + kw.length) if (occupied[p]) { free = false; break }
+                if (free) {
+                    val next = raw.indexOf(kw, idx + 1)
+                    // ★ 反屏蔽词：单字若落在无关合成词内部（雨伞/木马/雷神/马尾…）不触发
+                    //   清单存于 AppPrefs，用户可在设置页增删改，实时读取生效
+                    if (isSingle && isInBlockedWord(raw, idx)) { idx = next; continue }
+                    // ★ 关键词冷静期：同一关键词在窗口内不重复触发
+                    if (now - (lastKwTriggerAt[kw] ?: 0L) < SFX_KW_REPEAT_WINDOW_MS) { idx = next; continue }
+                    // ★ 随机概率：所有关键词都按概率触发（不是每次命中都响）
+                    if (rnd.nextFloat() > triggerProb) { idx = next; continue }
+                    val name = cands[rnd.nextInt(cands.size)]
+                    // ★ 音效冷静期：同一音效在窗口内不重复触发
+                    if (now - (lastSfxPlayAt[name] ?: 0L) < SFX_REPEAT_WINDOW_MS) { idx = next; continue }
+                    // 通过所有检查→真正触发
+                    lastKwTriggerAt[kw] = now
+                    lastSfxPlayAt[name] = now
+                    for (p in idx until idx + kw.length) occupied[p] = true
+                    out.add(com.mtts.app.util.TextPreprocessor.SfxAt(name, idx.toFloat() / len))
+                }
                 idx = raw.indexOf(kw, idx + kw.length)
             }
         }
-        return out.sortedBy { it.at }
+        return out
+    }
+
+    /** 判断单字关键词所在的字符位（charIdx）是否处于某个「反屏蔽词」内部。
+     *  反屏蔽词清单存于 AppPrefs（用户可增删改），每次匹配实时读取，改动立即生效。 */
+    private fun isInBlockedWord(raw: String, charIdx: Int): Boolean {
+        for (w in cachedBlockedWords()) {
+            if (charIdx >= w.length - 1) {
+                var i = raw.indexOf(w)
+                while (i >= 0) {
+                    if (charIdx >= i && charIdx < i + w.length) return true
+                    i = raw.indexOf(w, i + w.length)
+                }
+            }
+        }
+        return false
     }
 
     /** PCM16 小端 ByteArray → ShortArray */
@@ -856,7 +1062,11 @@ class MainViewModel : ViewModel() {
         while (offset < data.size && track != null && !stopRequested) {
             val len = minOf(blockW, data.size - offset)
             val written = finalTrack.write(data, offset, len)
-            if (written <= 0) throw RuntimeException(str(R.string.err_play_failed) + " (write=$written)")
+            if (written <= 0) {
+                // ★ 停止导致的 write 失败不算异常——静默退出，不抛 RuntimeException
+                if (stopRequested || track == null) break
+                throw RuntimeException(str(R.string.err_play_failed) + " (write=$written)")
+            }
             offset += written
         }
         val writeMs = System.currentTimeMillis() - writeStart
@@ -908,7 +1118,7 @@ class MainViewModel : ViewModel() {
                     val clean = TextPreprocessor.stripAllMarkers(t)
                     val effVol = (vol * volMark).coerceIn(0f, 2f)
                     val effPit = (pit + pitMark).coerceIn(-1f, 1f)
-                    val pcm = engine.synthesize(clean, voice, spd, 1.0f, effPit)
+                    val pcm = synthesizeWithTimeout(engine, voice, spd, 1.0f, effPit, clean)
                     if (pcm.isEmpty()) throw RuntimeException(str(R.string.err_no_audio))
                     // ★ 峰值归一化音量均衡
                     val balanced = PcmResampler.balanceVolume16BitMono(pcm, effVol)
@@ -1097,6 +1307,8 @@ class MainViewModel : ViewModel() {
                     startBgmLoop()
                     // 逐行合成并立即播放，进度行与实际发声严格同步。
                     // ★ stopRequested 不在此重置：若用户在进入循环前就按了 stop，此处重置会吞掉请求
+                    // ★ 防回环静默熔断：连续多行合成失败（引擎故障/断网）时不无限跳过，有界退出
+                    var consecutiveLineFailures = 0
                     for (i in parsed.indices) {
                         // 循环开头即检查 stop，避免停后仍合成/播出下一句
                         if (stopRequested) break
@@ -1108,10 +1320,20 @@ class MainViewModel : ViewModel() {
                             continue
                         }
                         val engine = EngineRegistry.get(role.engineCode)
-                            ?: throw RuntimeException(str(R.string.dialog_engine_missing, role.engineCode))
+                        if (engine == null) {
+                            MttsLog.w("Dialog", "line[$i] 引擎缺失 ${role.engineCode}，跳过")
+                            consecutiveLineFailures++
+                            if (consecutiveLineFailures >= 5) throw RuntimeException("连续多行失败，停止播放")
+                            continue
+                        }
                         val voice = role.voice.ifBlank {
-                            engine.listVoices().firstOrNull()?.shortName
-                                ?: throw RuntimeException(str(R.string.dialog_role_no_voice, role.label))
+                            engine.listVoices().firstOrNull()?.shortName ?: ""
+                        }
+                        if (voice.isBlank()) {
+                            MttsLog.w("Dialog", "line[$i] 无可用音色，跳过")
+                            consecutiveLineFailures++
+                            if (consecutiveLineFailures >= 5) throw RuntimeException("连续多行失败，停止播放")
+                            continue
                         }
                         MttsLog.d("Dialog", "line[$i] synth", mapOf(
                             "role" to role.label, "engine" to engine.code, "voice" to voice, "text" to line.text.take(16)))
@@ -1128,8 +1350,15 @@ class MainViewModel : ViewModel() {
                         val cleanText = TextPreprocessor.stripAllMarkers(line.text)
                         val effVol = (vol * volMark).coerceIn(0f, 2f)
                         val effPit = (pit + pitMark).coerceIn(-1f, 1f)
-                        var pcm = engine.synthesize(cleanText, voice, spd, 1.0f, effPit)
-                        if (pcm.isEmpty()) throw RuntimeException(str(R.string.dialog_role_no_audio, role.label))
+                        var pcm = synthesizeWithTimeout(engine, voice, spd, 1.0f, effPit, cleanText)
+                        // ★ 空 PCM（纯标点/引擎偶发空输出）：跳过该行继续，不中断全书播放
+                        if (pcm.isEmpty()) {
+                            MttsLog.w("Dialog", "line[$i] 空 PCM，跳过继续")
+                            consecutiveLineFailures++
+                            if (consecutiveLineFailures >= 5) throw RuntimeException("连续多行空音频，疑似引擎故障，停止播放")
+                            continue
+                        }
+                        consecutiveLineFailures = 0
                         // ★ 峰值归一化音量均衡
                         pcm = PcmResampler.balanceVolume16BitMono(pcm, effVol)
                         // 追加停顿静音（按引擎真实采样率生成，与 PCM 同采样率）
@@ -1156,13 +1385,22 @@ class MainViewModel : ViewModel() {
                         }
                     }
                 } catch (e: Exception) {
-                    MttsLog.e("Dialog", "play failed", e)
-                    try { track?.pause() } catch (_: Throwable) {}
-                    try { track?.flush() } catch (_: Throwable) {}
-                    try { track?.release() } catch (_: Throwable) {}
-                    track = null
-                    _dialog.value = _dialog.value.copy(
-                        playing = false, error = e.message ?: str(R.string.dialog_play_failed))
+                    if (stopRequested) {
+                        // ★ 用户主动停止导致的 write 中断不算错误——静默处理
+                        try { track?.pause() } catch (_: Throwable) {}
+                        try { track?.flush() } catch (_: Throwable) {}
+                        try { track?.release() } catch (_: Throwable) {}
+                        track = null
+                        _dialog.value = _dialog.value.copy(playing = false)
+                    } else {
+                        MttsLog.e("Dialog", "play failed", e)
+                        try { track?.pause() } catch (_: Throwable) {}
+                        try { track?.flush() } catch (_: Throwable) {}
+                        try { track?.release() } catch (_: Throwable) {}
+                        track = null
+                        _dialog.value = _dialog.value.copy(
+                            playing = false, error = e.message ?: str(R.string.dialog_play_failed))
+                    }
                 }
             }
             stopRequested = false

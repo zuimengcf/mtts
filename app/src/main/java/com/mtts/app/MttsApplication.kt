@@ -103,4 +103,19 @@ class MttsApplication : Application() {
             com.mtts.app.service.KeepAliveService.start(this)
         }
     }
+
+    // ★ 内存压力时清理音效/BGM 解码缓存（避免后台缓存 PCM 占内存）
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_BACKGROUND) {
+            com.mtts.app.util.SoundEffectManager.clearCache()
+            MttsLog.d("App", "onTrimMemory level=$level → sfx/bgm cache cleared")
+        }
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        com.mtts.app.util.SoundEffectManager.clearCache()
+        MttsLog.d("App", "onLowMemory → sfx/bgm cache cleared")
+    }
 }

@@ -824,7 +824,7 @@ object TextPreprocessor {
     // ---------- 内置小规则（保底，仅当语音包无 replaces.yaml 时兜底常见符号） ----------
 
     private fun builtinRules(): List<ReplaceRule> = listOf(
-        ReplaceRule(name = "省略号→停顿", regex = true, source = "(…+|\\.{3,6})", target = " ——"),
+        ReplaceRule(name = "省略号→停顿", regex = true, source = "\\.{2,}|…+", target = "，"),
         ReplaceRule(name = "竖线→消音", regex = true, source = "(?<!\\d)\\|(?!\\d)", target = ""),
         ReplaceRule(name = "等于→等于", regex = true, source = "(?<=[0-9a-zA-Z])=(?=[0-9a-zA-Z])", target = "等于"),
         ReplaceRule(name = "乘号→乘", regex = true, source = "[ꁘ*＊Xx×](?=\\d)", target = "乘"),
@@ -947,7 +947,7 @@ object TextPreprocessor {
     )
 /** 标点停顿规则（默认 50ms，保留标点本身并**追加**停顿标记） */
     private val PUNCT_PAUSE = listOf(
-        Triple(Regex("…+|…{2,}|\\.{3,6}"), 50, "省略号停顿"),
+        Triple(Regex("\\.{2,}|…+"), 50, "省略号停顿"),
         Triple(Regex("[。！？!?]"), 50, "句末停顿"),
         Triple(Regex("[，,、；;]"), 50, "句中停顿"),
         Triple(Regex("[：:]"), 50, "冒号停顿"),

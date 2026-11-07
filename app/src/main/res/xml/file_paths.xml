@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 日志分享：cacheDir/shared_logs/ 下的临时文件 -->
+    <cache-path name="shared_logs" path="shared_logs/" />
+</paths>

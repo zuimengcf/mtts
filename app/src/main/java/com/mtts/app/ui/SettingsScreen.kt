@@ -59,6 +59,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import android.net.Uri
+import androidx.core.content.FileProvider
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import androidx.compose.ui.graphics.vector.ImageVector
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -618,7 +623,7 @@ private fun VoicePacksContent(vm: MainViewModel) {
     }
 }
 
-/** 日志 —— 实时显示 TTS 合成日志（输入文本 → 输出结果），参考 tts-server 的可视化日志 */
+/** 日志 —— 双通道：朗读日志（用户可读）/ 完整日志（测试开发），支持分享导出 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun LogsContent() {
@@ -626,46 +631,119 @@ private fun LogsContent() {
     val scope = rememberCoroutineScope()
     var logText by remember { mutableStateOf("") }
     var autoRefresh by remember { mutableStateOf(true) }
+    // ★ 双通道切换：false=朗读日志（默认），true=完整日志
+    var fullMode by remember { mutableStateOf(false) }
+    val fullLogEnabled = remember { mutableStateOf(com.mtts.app.util.AppPrefs.isFullLogEnabled()) }
 
-    // 读取今日日志（IO 线程），倒序显示：最新在最上
+    // 读取当前通道日志（IO 线程），倒序显示：最新在最上
     fun load() {
         scope.launch {
             val text = withContext(Dispatchers.IO) {
-                val raw = com.mtts.app.util.FileLog.readToday(ctx)
-                // 按行倒序，最新的日志行排在最上方
-                raw.trim().lines().reversed().joinToString("\n")
+                val raw = if (fullMode) com.mtts.app.util.FileLog.readTodayFull(ctx)
+                          else com.mtts.app.util.FileLog.readTodaySpeech(ctx)
+                formatSpeechLog(raw.trim().lines().reversed().joinToString("\n"), fullMode)
             }
             logText = text
         }
     }
 
     LaunchedEffect(Unit) { load() }
+    LaunchedEffect(fullMode) { load() }
 
     // 自动刷新：每 2 秒拉取一次（同样倒序显示）
-    LaunchedEffect(autoRefresh) {
+    LaunchedEffect(autoRefresh, fullMode) {
         while (autoRefresh) {
             delay(2000)
             scope.launch {
                 val text = withContext(Dispatchers.IO) {
-                    val raw = com.mtts.app.util.FileLog.readToday(ctx)
-                    raw.trim().lines().reversed().joinToString("\n")
+                    val raw = if (fullMode) com.mtts.app.util.FileLog.readTodayFull(ctx)
+                              else com.mtts.app.util.FileLog.readTodaySpeech(ctx)
+                    formatSpeechLog(raw.trim().lines().reversed().joinToString("\n"), fullMode)
                 }
                 logText = text
             }
         }
     }
 
+    // ★ 分享：写入 cacheDir/shared_logs/ 临时文件，经 FileProvider 以文件方式系统分享
+    fun shareCurrent() {
+        if (logText.isBlank()) return
+        try {
+            val dir = File(ctx.cacheDir, "shared_logs").apply { mkdirs() }
+            // 先清掉旧的临时分享文件
+            dir.listFiles()?.forEach { it.delete() }
+            val name = if (fullMode) "mtts-full-${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())}.log"
+                       else "mtts-speech-${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())}.log"
+            val f = File(dir, name)
+            f.writeText(logText)
+            val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", f)
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TITLE, name)
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            ctx.startActivity(Intent.createChooser(intent, "分享日志"))
+        } catch (_: Throwable) {}
+    }
+
     Column(modifier = Modifier.fillMaxSize()) {
         AppSectionTitle(ctx.getString(R.string.logs_title))
         Spacer(Modifier.padding(4.dp))
-        Text(
-            ctx.getString(R.string.logs_desc),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.secondary
-        )
+
+        // ★ 通道切换：朗读日志 / 完整日志
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            AppOutlinedButton(
+                text = if (!fullMode) "● 朗读日志" else "朗读日志",
+                onClick = { fullMode = false },
+                modifier = Modifier.weight(1f)
+            )
+            AppOutlinedButton(
+                text = if (fullMode) "● 完整日志" else "完整日志",
+                onClick = { fullMode = true },
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        when (fullMode) {
+            false -> {
+                Text(
+                    "面向用户：每条请求一行（输入 → 音色 → 输出结果），自动过滤引擎调试细节。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.secondary
+                )
+            }
+            true -> {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "面向测试/开发：含全部调试细节（引擎内部/段级/BGM/JNI）。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.secondary,
+                        modifier = Modifier.weight(1f)
+                    )
+                    androidx.compose.material3.Switch(
+                        checked = fullLogEnabled.value,
+                        onCheckedChange = { on ->
+                            fullLogEnabled.value = on
+                            com.mtts.app.util.AppPrefs.setFullLogEnabled(on)
+                        }
+                    )
+                }
+                if (!fullLogEnabled.value) {
+                    Text(
+                        "⚠ 完整日志当前关闭，打开上方开关后开始记录。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+        }
         Spacer(Modifier.padding(8.dp))
 
-        // 操作栏：自动开关 / 刷新 / 清空
+        // 操作栏：自动开关 / 刷新 / 分享 / 清空
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             AppOutlinedButton(
                 text = if (autoRefresh) ctx.getString(R.string.logs_auto_refresh)
@@ -678,14 +756,20 @@ private fun LogsContent() {
                 onClick = { load() },
                 modifier = Modifier.weight(1f)
             )
+        }
+        Spacer(Modifier.padding(4.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            AppOutlinedButton(
+                text = "分享",
+                icon = Icons.Default.ExitToApp,
+                onClick = { shareCurrent() },
+                modifier = Modifier.weight(1f)
+            )
             AppOutlinedButton(
                 text = ctx.getString(R.string.action_clear_log),
                 onClick = {
                     scope.launch {
-                        withContext(Dispatchers.IO) {
-                            val dir = java.io.File(ctx.filesDir, "logs")
-                            dir.listFiles { _, name -> name.endsWith(".log") }?.forEach { it.delete() }
-                        }
+                        withContext(Dispatchers.IO) { com.mtts.app.util.FileLog.clearAll(ctx) }
                         logText = ""
                     }
                 },
@@ -695,27 +779,32 @@ private fun LogsContent() {
 
         Spacer(Modifier.padding(4.dp))
         Text(
-            ctx.getString(R.string.logs_file_hint),
+            if (fullMode) "文件：{filesDir}/logs/full-yyyyMMdd.log"
+            else "文件：{filesDir}/logs/speech-yyyyMMdd.log",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.secondary
         )
         Spacer(Modifier.padding(8.dp))
 
         // 日志内容
-        Card(
-            Modifier.fillMaxWidth().weight(1f),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-        ) {
-            if (logText.isBlank()) {
+        when {
+            logText.isBlank() -> Card(
+                Modifier.fillMaxWidth().weight(1f),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
                 Column(Modifier.padding(16.dp)) {
                     Text(
-                        ctx.getString(R.string.logs_empty),
+                        if (fullMode && !fullLogEnabled.value) "完整日志未开启。打开上方开关后开始记录。"
+                        else ctx.getString(R.string.logs_empty),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.secondary
                     )
                 }
-            } else {
-                // 单色等宽字体逐行展示，便于对齐"输入文本→输出结果"
+            }
+            fullMode -> Card(
+                Modifier.fillMaxWidth().weight(1f),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
                 Text(
                     text = logText,
                     modifier = Modifier
@@ -727,8 +816,149 @@ private fun LogsContent() {
                     )
                 )
             }
+            // ★ 朗读日志：以朗读文字为主行，下方小字简略显示字段（时间/音色/结果）
+            else -> {
+                val entries = remember(logText) { parseSpeechEntries(logText) }
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    items(entries.size, key = { entries[it].id }) { i ->
+                        val e = entries[i]
+                        Card(
+                            Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (e.isError) MaterialTheme.colorScheme.errorContainer
+                                                 else MaterialTheme.colorScheme.surface
+                            ),
+                            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+                            shape = MaterialTheme.shapes.medium
+                        ) {
+                            Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
+                                // 主行：朗读文字（无则显示占位说明）
+                                Text(
+                                    text = e.text.ifBlank { "（空文本请求）" },
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = if (e.isError) MaterialTheme.colorScheme.onErrorContainer
+                                            else MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 3,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                )
+                                Spacer(Modifier.height(2.dp))
+                                // 简略字段行：时间 状态 音色 耗时
+                                Text(
+                                    text = e.fields,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (e.isError) MaterialTheme.colorScheme.onErrorContainer
+                                            else MaterialTheme.colorScheme.secondary
+                                )
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
+}
+
+/** 朗读日志卡片条目：主行=朗读文字，次行=简略字段 */
+private data class SpeechEntry(
+    val id: Long,
+    val text: String,
+    val fields: String,
+    val isError: Boolean
+)
+
+/**
+ * 把朗读日志行聚合为条目：以 "REQ #N start" 开新条目（主行取朗读文字），
+ * 同一请求的后续行（done/警告/中断）追加为字段信息，不单独成卡。
+ */
+private fun parseSpeechEntries(text: String): List<SpeechEntry> {
+    data class Acc(val id: Long, val text: String, val fields: MutableList<String>, val isError: Boolean)
+
+    val out = mutableListOf<Acc>()
+    var seq = 0L
+    val reqRe = Regex("""^(\d{2}:\d{2}:\d{2}\.\d{3})\s*·?\s*(?:ℹ|⚠|✗)?\s*(?:mtts/)*Tts:\s*REQ #(\d+) (start|done|✗|⏹)\s*(.*)$""")
+    val textRe = Regex("""text="([^"]*)"""")
+    val voiceRe = Regex("""voice=([\w:\-]+)""")
+    val bytesRe = Regex("""bytes=(\d+)""")
+    val durRe = Regex("""dur=(\d+)ms""")
+
+    for (raw in text.lines()) {
+        val line = raw.trim()
+        if (line.isEmpty()) continue
+        val m = reqRe.find(line)
+        if (m != null) {
+            val (time, reqNo, kind, rest) = m.destructured
+            val isErr = kind == "✗" || line.contains("✗✗") || line.contains("异常终止")
+            when (kind) {
+                "start" -> {
+                    val t = textRe.find(rest)?.groupValues?.get(1) ?: ""
+                    val voice = voiceRe.find(rest)?.groupValues?.get(1) ?: ""
+                    out.add(Acc(seq++, t, mutableListOf(time, voice), isErr))
+                }
+                "done" -> {
+                    val bytes = bytesRe.find(rest)?.groupValues?.get(1)
+                    val dur = durRe.find(rest)?.groupValues?.get(1)
+                    val f = buildString {
+                        append("完成")
+                        bytes?.let { append("  ${it}B") }
+                        dur?.let { append("  ${it}ms") }
+                    }
+                    if (out.isNotEmpty()) out.last().fields.add(f) else out.add(Acc(seq++, "", mutableListOf(time, f), isErr))
+                }
+                else -> { // ✗ / ⏹ 异常或中断
+                    val f = if (isErr) "失败" else "已停止"
+                    if (out.isNotEmpty()) {
+                        out.last().fields.add(f)
+                        if (isErr) out.last().fields.add(rest.take(40))
+                    } else {
+                        out.add(Acc(seq++, "", mutableListOf(time, f), isErr))
+                    }
+                }
+            }
+        } else {
+            // 非请求行（BGM/其它服务行）：仅当与最后条目同流时作为补充字段，否则跳过
+            if (out.isNotEmpty() && (line.contains("bgm player") || line.contains("STOP") || line.contains("onDestroy") || line.contains("onCreate"))) {
+                val tag = when {
+                    line.contains("bgm player start") -> "BGM 启动"
+                    line.contains("bgm player stop") -> "BGM 停止"
+                    line.contains("STOP") -> "外部停止"
+                    line.contains("onDestroy") -> "服务销毁"
+                    else -> "服务启动"
+                }
+                out.last().fields.add(tag)
+            }
+        }
+    }
+    return out.map { e ->
+        SpeechEntry(e.id, e.text, e.fields.distinct().joinToString("  ·  "), e.isError)
+    }.reversed()
+}
+
+/**
+ * 朗读日志可读性优化：压缩 TTS 主流程行，过滤噪音行。
+ *  - 去掉时间戳前的 "[D]/[I]/[W] mtts/" 冗余前缀（保留时间与级别色块）
+ *  - 引擎内部的段级调试行（seg[...]、synthesize result 等纯 D 级已在写入侧过滤，这里再做一层兜底）
+ */
+private fun formatSpeechLog(text: String, fullMode: Boolean): String {
+    if (fullMode) return text
+    return text.lines().mapNotNull { line ->
+        val trimmed = line.trim()
+        if (trimmed.isEmpty()) return@mapNotNull null
+        // 兜底过滤（写入侧已过滤大部分）：引擎内部细节行不出现在朗读日志
+        if (trimmed.contains("MsEmbed") || trimmed.contains("Sougou") ||
+            trimmed.contains("BdTTS") || trimmed.contains("Sherpa")) return@mapNotNull null
+        // 压缩级别前缀：[I] → ℹ  [W] → ⚠  [E] → ✗  [D] → ·
+        // 同时压缩 MttsLog 冗余的 "mtts/mtts/" 标签前缀 → 只留 "Tts:" 等短标签
+        val compact = trimmed
+            .replace("[I]", "ℹ")
+            .replace("[W]", "⚠")
+            .replace("[E]", "✗")
+            .replace("[D]", "·")
+            .replace(Regex("""(?:mtts/)+(?=\w+:)"""), "")
+        compact
+    }.joinToString("\n")
 }
 
 /** 测试文本 —— 编辑内置测试的默认文本 */
@@ -1193,6 +1423,7 @@ private fun SoundFxContent(vm: MainViewModel) {
                     sfxEntries = newEntries
                     com.mtts.app.util.AppPrefs.saveSfxMap(newEntries)
                     com.mtts.app.util.SoundEffectManager.clearCache()
+                    vm.invalidateSfxCache()
                 }
             } catch (e: Exception) {
                 com.mtts.app.util.MttsLog.w("SoundFx", "选择音频失败: ${e.message}")
@@ -1207,6 +1438,15 @@ private fun SoundFxContent(vm: MainViewModel) {
     var editingKw by remember { mutableStateOf<Pair<String, String>?>(null) }
     // 添加关键词对话框
     var showAddKw by remember { mutableStateOf(false) }
+    // 反屏蔽词（音效规避词）列表
+    var blockedWords by remember { mutableStateOf(com.mtts.app.util.AppPrefs.loadSfxBlockedWords()) }
+    // 添加反屏蔽词对话框
+    var showAddBlocked by remember { mutableStateOf(false) }
+    // 编辑反屏蔽词（存原词）
+    var editingBlocked by remember { mutableStateOf<String?>(null) }
+    // 反屏蔽词折叠 + 搜索
+    var blockedListOpen by remember { mutableStateOf(false) }
+    var blockedQuery by remember { mutableStateOf("") }
     // 折叠 + 搜索（注册表 / 关键词表）
     var sfxListOpen by remember { mutableStateOf(false) }
     var sfxQuery by remember { mutableStateOf("") }
@@ -1260,7 +1500,10 @@ private fun SoundFxContent(vm: MainViewModel) {
             batchImporting = false
             batchMsg = if (failed.isEmpty()) "已导入 $ok 个音效"
                        else "导入 $ok 个成功，${failed.size} 个失败"
-            if (ok > 0) com.mtts.app.util.SoundEffectManager.clearCache()
+            if (ok > 0) {
+                com.mtts.app.util.SoundEffectManager.clearCache()
+                vm.invalidateSfxCache()
+            }
             // 刷新注册表显示
             sfxEntries = com.mtts.app.util.AppPrefs.loadSfxMap()
         }
@@ -1327,6 +1570,7 @@ private fun SoundFxContent(vm: MainViewModel) {
                         bgmVolume = it
                         com.mtts.app.util.AppPrefs.setBgmVolume(it)
                         com.mtts.app.util.SoundEffectManager.bgmVolume = it
+                        vm.updateBgmVolume(it)   // ★ 实时推给正在播放的 BGM
                     },
                     valueRange = 0f..1f
                 )
@@ -1502,6 +1746,7 @@ private fun SoundFxContent(vm: MainViewModel) {
                             kwEntries = newKw
                             com.mtts.app.util.AppPrefs.saveSfxKeywords(newKw)
                             com.mtts.app.util.SoundEffectManager.clearCache()
+                            vm.invalidateSfxCache()
                         }) {
                             Icon(Icons.Default.Delete, "删除 $name",
                                  tint = MaterialTheme.colorScheme.error)
@@ -1630,6 +1875,114 @@ private fun SoundFxContent(vm: MainViewModel) {
         }
 
         Spacer(Modifier.padding(12.dp))
+        // 反屏蔽词（音效规避词）：单字关键词落在这些词内部时不再触发对应音效
+        Card(
+            Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+            shape = MaterialTheme.shapes.large
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+                    .clickable { blockedListOpen = !blockedListOpen }
+                    .padding(horizontal = 16.dp, vertical = 14.dp)
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("反屏蔽词（音效规避词）", style = MaterialTheme.typography.bodyLarge)
+                    Text("正文出现这些词时不触发其中的单字音效（如「雨伞/木马/雷神」里的「雨/马/雷」）。共 ${blockedWords.size} 条，可增删改。",
+                         style = MaterialTheme.typography.bodySmall,
+                         color = MaterialTheme.colorScheme.secondary)
+                }
+                Icon(
+                    if (blockedListOpen) androidx.compose.material.icons.Icons.Filled.KeyboardArrowUp
+                    else androidx.compose.material.icons.Icons.Filled.KeyboardArrowDown,
+                    if (blockedListOpen) "收起" else "展开",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        AppOutlinedButton(text = "添加规避词", onClick = { showAddBlocked = true }, modifier = Modifier.fillMaxWidth())
+        if (blockedListOpen) {
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = blockedQuery,
+                onValueChange = { blockedQuery = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("搜索规避词") },
+                singleLine = true
+            )
+            Spacer(Modifier.height(8.dp))
+            val bq = blockedQuery.trim().lowercase()
+            val bshown = blockedWords.filter { bq.isBlank() || it.lowercase().contains(bq) }
+            if (bshown.isEmpty()) {
+                Text(if (blockedWords.isEmpty()) "暂无规避词。" else "无匹配条目",
+                     style = MaterialTheme.typography.bodySmall,
+                     color = MaterialTheme.colorScheme.secondary)
+            } else {
+                bshown.forEach { w ->
+                    Card(
+                        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+                        shape = MaterialTheme.shapes.medium
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)
+                                .clickable { editingBlocked = w }
+                        ) {
+                            Text("「$w」", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                            IconButton(onClick = { editingBlocked = w }) {
+                                Icon(Icons.Default.Edit, "编辑",
+                                     tint = MaterialTheme.colorScheme.primary)
+                            }
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+        if (showAddBlocked) {
+            AddBlockedWordDialog(
+                onDismiss = { showAddBlocked = false },
+                onConfirm = { word ->
+                    showAddBlocked = false
+                    if (word.isNotBlank()) {
+                        com.mtts.app.util.AppPrefs.saveSfxBlockedWords(
+                            blockedWords + word.trim()
+                        )
+                        blockedWords = com.mtts.app.util.AppPrefs.loadSfxBlockedWords()
+                        vm.invalidateSfxCache()
+                    }
+                }
+            )
+        }
+        editingBlocked?.let { word ->
+            EditBlockedWordDialog(
+                initialWord = word,
+                onDismiss = { editingBlocked = null },
+                onSave = { newWord ->
+                    editingBlocked = null
+                    if (newWord.isNotBlank()) {
+                        com.mtts.app.util.AppPrefs.saveSfxBlockedWords(
+                            blockedWords.map { if (it == word) newWord.trim() else it }
+                        )
+                        blockedWords = com.mtts.app.util.AppPrefs.loadSfxBlockedWords()
+                        vm.invalidateSfxCache()
+                    }
+                },
+                onDelete = {
+                    editingBlocked = null
+                    com.mtts.app.util.AppPrefs.saveSfxBlockedWords(blockedWords.filter { it != word })
+                    blockedWords = com.mtts.app.util.AppPrefs.loadSfxBlockedWords()
+                    vm.invalidateSfxCache()
+                }
+            )
+        }
+
+        Spacer(Modifier.padding(12.dp))
         // 音效导入导出（zip：注册表+关键词+配置+音频，可部分导入）
         val sfxExportPicker = androidx.activity.compose.rememberLauncherForActivityResult(
             androidx.activity.result.contract.ActivityResultContracts.CreateDocument("application/zip")
@@ -1727,6 +2080,7 @@ private fun SoundFxContent(vm: MainViewModel) {
                     val newKw = kwEntries.filter { it.first != kw } + (kw to name)
                     kwEntries = newKw
                     com.mtts.app.util.AppPrefs.saveSfxKeywords(newKw)
+                    vm.invalidateSfxCache()
                 }
             }
         )
@@ -1751,6 +2105,7 @@ private fun SoundFxContent(vm: MainViewModel) {
                 kwEntries = newKw
                 com.mtts.app.util.AppPrefs.saveSfxKeywords(newKw)
                 com.mtts.app.util.SoundEffectManager.clearCache()
+                vm.invalidateSfxCache()
             }
         )
     }
@@ -1769,12 +2124,14 @@ private fun SoundFxContent(vm: MainViewModel) {
                 list = list.filter { it.first != nk } + (nk to newName)
                 kwEntries = list
                 com.mtts.app.util.AppPrefs.saveSfxKeywords(list)
+                vm.invalidateSfxCache()
             },
             onDelete = {
                 editingKw = null
                 val list = kwEntries.filter { it.first != oldKw }
                 kwEntries = list
                 com.mtts.app.util.AppPrefs.saveSfxKeywords(list)
+                vm.invalidateSfxCache()
             }
         )
     }
@@ -1827,6 +2184,75 @@ private fun EditSfxDialog(
         },
         confirmButton = { AppPrimaryButton(text = "保存", onClick = { onSave(name) }, enabled = name.isNotBlank()) },
         dismissButton = { AppOutlinedButton(text = "取消", onClick = onDismiss) }
+    )
+}
+
+/** 添加反屏蔽词（音效规避词）对话框 */
+@Composable
+private fun AddBlockedWordDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
+    var word by remember { mutableStateOf("") }
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("添加规避词") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = word, onValueChange = { word = it },
+                    label = { Text("规避词（如：雨伞、木马）") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                Text("正文出现该词时，其中的单字音效关键词不再触发。",
+                     style = MaterialTheme.typography.bodySmall,
+                     color = MaterialTheme.colorScheme.secondary)
+            }
+        },
+        confirmButton = { AppPrimaryButton(text = "保存", onClick = { onConfirm(word) }, enabled = word.isNotBlank()) },
+        dismissButton = { AppOutlinedButton(text = "取消", onClick = onDismiss) }
+    )
+}
+
+/** 编辑反屏蔽词（音效规避词）对话框：改词 / 删除 */
+@Composable
+private fun EditBlockedWordDialog(
+    initialWord: String,
+    onDismiss: () -> Unit,
+    onSave: (String) -> Unit,
+    onDelete: () -> Unit
+) {
+    var word by remember { mutableStateOf(initialWord) }
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("编辑规避词") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = word, onValueChange = { word = it },
+                    label = { Text("规避词") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                Text("正文出现该词时，其中的单字音效关键词不再触发。",
+                     style = MaterialTheme.typography.bodySmall,
+                     color = MaterialTheme.colorScheme.secondary)
+            }
+        },
+        confirmButton = {
+            AppPrimaryButton(text = "保存", onClick = { onSave(word) }, enabled = word.isNotBlank())
+        },
+        dismissButton = {
+            Row {
+                TextButton(onClick = onDelete) {
+                    Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
+                    Spacer(Modifier.width(4.dp))
+                    Text("删除", color = MaterialTheme.colorScheme.error)
+                }
+                Spacer(Modifier.width(4.dp))
+                AppOutlinedButton(text = "取消", onClick = onDismiss)
+            }
+        }
     )
 }
 

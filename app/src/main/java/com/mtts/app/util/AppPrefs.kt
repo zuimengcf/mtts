@@ -582,6 +582,12 @@ object AppPrefs {
     private const val KEY_SFX_VOLUME = "sfx_sfx_volume"
     private const val KEY_SFX_MAP = "sfx_map"          // 每行：标记名|文件路径
     private const val KEY_SFX_KEYWORDS = "sfx_keywords" // 每行：关键词|标记名
+    private const val KEY_SFX_BLOCKED_WORDS = "sfx_blocked_words" // 反屏蔽词：每行一个词
+    private const val KEY_LOG_FULL = "log_full_enabled" // 完整日志（含全部 D 级调试细节），默认关
+
+    /** 完整日志开关：开启后文件日志记录全部 D 级调试细节；关闭时只保留朗读日志所需条目 */
+    fun isFullLogEnabled(): Boolean = getBoolean(KEY_LOG_FULL, false)
+    fun setFullLogEnabled(on: Boolean) = putBoolean(KEY_LOG_FULL, on)
 
     fun isBgmEnabled(): Boolean = getBoolean(KEY_BGM_ENABLED, false)
     fun setBgmEnabled(on: Boolean) = putBoolean(KEY_BGM_ENABLED, on)
@@ -630,6 +636,82 @@ object AppPrefs {
             if (p.size >= 2 && p[0].isNotBlank() && p[1].isNotBlank()) out.add(p[0].trim() to p[1].trim())
         }
         return out
+    }
+
+    // ---------- 反屏蔽词（音效规避词） ----------
+
+    /**
+     * 内置反屏蔽词默认清单。
+     * 单字关键词（如「雨」「雷」「马」「剑」「猫」…）会误命中这些无关合成词里的单字，
+     * 故把常见复合词列入规避词：正文出现这些词时不触发其中的单字音效。
+     * 用户可在设置页增删改；首启播种默认值，此后以用户配置为准。
+     */
+    private val BUILTIN_SFX_BLOCKED_WORDS = listOf(
+        // 雨 (rain)
+        "雨伞", "雨衣", "雨靴", "雨披", "雨棚", "雨幕", "雨势", "雨量",
+        // 雷 (thunder)
+        "雷神", "雷人", "雷同", "雷达", "地雷", "鱼雷", "手雷", "雷管", "布雷", "排雷", "扫雷",
+        // 马 (horse)
+        "木马", "马尾", "马路", "码头", "马车", "马达", "马上", "马力", "马甲",
+        "斑马", "河马", "海马", "铁马", "兵马", "牛马", "骑马",
+        // 锁 (lock)
+        "封存", "封锁", "贴锁", // 锁多为事件词，保留少量
+        // 刀 (knife) —— 只拦常见非刀义
+        "刀锋", "刀具", "刀疤", "刀片", "手术刀",
+        // 剑 (sword) —— 剑通常确指武器，少拦
+        "剑镖", "剑齿虎",
+        // 猫 (cat)
+        "猫腻", "猫眼", "熊猫", "猫头鹰",
+        // 狗 (dog)
+        "热狗", "狗皮", "走狗", "狗腿", "狗窝",
+        // 牛 (cattle)
+        "牛气", "牛皮", "牛人", "牛市", "吹牛", "牢牛", "水牛", "蜗牛", "奶牛",
+        // 狼 (wolf)
+        "狼烟", "狼藉", "狼狈", "色狼", "灰太狼", "中山狼",
+        // 龙 (dragon)
+        "龙卷风", "恐龙", "龙头", "龙舟", "龙脉", "水龙", "火龙", "过山龙",
+        // 鸟 (bird)
+        "鸟瞰", "鸟笼", "海鸟", "候鸟", "鸟巢", "菜鸟",
+        // 水 (water)
+        "水平", "水泥", "水货", "水果", "水军", "水表", "水库", "水灾", "水井", "水沟",
+        // 电力/光
+        "电光", "雷电交加"
+    )
+
+    /** 反屏蔽词存储：每行一个词（去重、去空） */
+    fun saveSfxBlockedWords(words: List<String>) {
+        val unique = LinkedHashSet<String>()
+        for (w in words) { val t = w.trim(); if (t.isNotEmpty()) unique.add(t) }
+        val sb = StringBuilder()
+        for (w in unique) sb.append(w).append('\n')
+        putString(KEY_SFX_BLOCKED_WORDS, sb.toString())
+    }
+
+    /** 读取反屏蔽词；首启（未存过）时播种内置默认清单 */
+    fun loadSfxBlockedWords(): List<String> {
+        val raw = getString(KEY_SFX_BLOCKED_WORDS, "")
+        if (raw.isNullOrBlank()) {
+            // 首启播种：把默认清单落盘，之后用户可编辑
+            saveSfxBlockedWords(BUILTIN_SFX_BLOCKED_WORDS)
+            return BUILTIN_SFX_BLOCKED_WORDS.toList()
+        }
+        val out = ArrayList<String>()
+        for (line in raw.lines()) {
+            val t = line.trim()
+            if (t.isNotEmpty()) out.add(t)
+        }
+        return out
+    }
+
+    /** 追加一个反屏蔽词（去重后返回新列表） */
+    fun addSfxBlockedWord(word: String): List<String> {
+        val t = word.trim()
+        if (t.isEmpty()) return loadSfxBlockedWords()
+        val list = loadSfxBlockedWords().toMutableList()
+        if (list.contains(t)) return list
+        list.add(t)
+        saveSfxBlockedWords(list)
+        return list
     }
 
     // ---------- 内置示例音效（assets/soundfx，Mixkit，可免费商用） ----------

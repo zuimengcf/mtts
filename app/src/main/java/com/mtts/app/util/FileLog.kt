@@ -20,8 +20,12 @@ object FileLog {
     private const val TAG = "FileLog"
     // ★ 改用 LinkedBlockingQueue：take() 在无日志时阻塞（不消耗 CPU），替代旧 ConcurrentLinkedQueue + sleep(100) 轮询
     private val queue = LinkedBlockingQueue<String>()
+    // ★ 双通道日志队列：朗读日志 / 完整日志（原始 queue 继续写 mtts-yyyyMMdd.log 兼容旧查看方式）
+    private val speechQueue = LinkedBlockingQueue<String>()
+    private val fullQueue = LinkedBlockingQueue<String>()
     private var logDir: File? = null
     @Volatile private var workerStarted = false
+    @Volatile private var extraWorkerStarted = false
 
     private val timeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
     private val dateFmt = SimpleDateFormat("yyyyMMdd", Locale.US)
@@ -32,6 +36,11 @@ object FileLog {
         if (!workerStarted) {
             workerStarted = true
             thread(isDaemon = true, name = "mtts-filelog") { writeLoop() }
+        }
+        if (!extraWorkerStarted) {
+            extraWorkerStarted = true
+            thread(isDaemon = true, name = "mtts-filelog-speech") { writeLoopTo("speech-") { speechQueue.take() } }
+            thread(isDaemon = true, name = "mtts-filelog-full") { writeLoopTo("full-") { fullQueue.take() } }
         }
         i("log-dir", logDir?.absolutePath ?: "null")
     }
@@ -60,6 +69,24 @@ object FileLog {
         }
     }
 
+    /** 双通道写循环：朗读日志 → speech-yyyyMMdd.log；完整日志 → full-yyyyMMdd.log */
+    private fun writeLoopTo(prefix: String, take: () -> String) {
+        while (true) {
+            try {
+                val line = take()
+                try {
+                    val dir = logDir ?: continue
+                    val f = File(dir, "${prefix}${dateFmt.format(Date())}.log")
+                    f.appendText(line + "\n")
+                } catch (t: Throwable) {
+                    // 写失败不影响主流程
+                }
+            } catch (_: InterruptedException) {
+                break
+            }
+        }
+    }
+
     fun v(sub: String, msg: String) { enqueue("V", sub, msg) }
     fun d(sub: String, msg: String) { enqueue("D", sub, msg) }
     fun i(sub: String, msg: String) { enqueue("I", sub, msg) }
@@ -70,7 +97,37 @@ object FileLog {
 
     private fun enqueue(level: String, sub: String, msg: String) {
         val t = timeFmt.format(Date())
-        queue.offer("$t [$level] mtts/$sub: $msg")
+        val line = "$t [$level] mtts/$sub: $msg"
+        // ★ 双通道分流：
+        //  - 朗读日志（speech）：I/W/E 全记录 + TTS 合成主流程的 D 级（Tts/Vm/BGM 引擎），面向用户可读性
+        //  - 完整日志（full）：需在设置中开启，记录全部行（含引擎内部 D 级细节），面向测试开发修复
+        queue.offer(line)
+        if (isSpeechLog(level, sub)) {
+            speechQueue.offer(line)
+        }
+        if (AppPrefs.isFullLogEnabled()) {
+            fullQueue.offer(line)
+        }
+    }
+
+    /** 朗读日志过滤：I/W/E 一律保留；D 级只保留 TTS 主流程与播放相关的 tag */
+    private fun isSpeechLog(level: String, sub: String): Boolean {
+        if (level != "D") return true
+        return sub == "Tts" || sub == "Vm" || sub == "BGM" || sub == "FileLog"
+    }
+
+    /** 读取今天的朗读日志（用户可读，默认展示） */
+    fun readTodaySpeech(context: Context): String {
+        val dir = File(context.filesDir, "logs")
+        val f = File(dir, "speech-${dateFmt.format(Date())}.log")
+        return if (f.exists()) f.readText() else ""
+    }
+
+    /** 读取今天的完整日志（测试/开发用，需先开启完整日志开关才有内容） */
+    fun readTodayFull(context: Context): String {
+        val dir = File(context.filesDir, "logs")
+        val f = File(dir, "full-${dateFmt.format(Date())}.log")
+        return if (f.exists()) f.readText() else ""
     }
 
 /** 读取今天的日志内容 */
@@ -83,6 +140,13 @@ object FileLog {
     fun listFiles(context: Context): List<File> {
         val dir = File(context.filesDir, "logs")
         return dir.listFiles { _, name -> name.endsWith(".log") }?.sortedByDescending { it.lastModified() } ?: emptyList()
+    }
+
+    /** 清空全部日志文件（主日志 + 朗读日志 + 完整日志 + logcat 抓取） */
+    fun clearAll(context: Context) {
+        val dir = File(context.filesDir, "logs")
+        dir.listFiles { _, name -> name.endsWith(".log") }?.forEach { it.delete() }
+        queue.clear(); speechQueue.clear(); fullQueue.clear()
     }
     /**
      * 抓取 logcat 中 mtts / 搜狗原生(JNI、com_log) 相关日志并写回文件。

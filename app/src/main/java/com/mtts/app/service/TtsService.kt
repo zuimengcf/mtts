@@ -53,24 +53,49 @@ class TtsService : TextToSpeechService() {
     private val TAG = "Tts"
     // 合成请求自增序号：每条请求一个 #N，贯穿其日志，便于按请求追踪生命周期
     private val reqCounter = java.util.concurrent.atomic.AtomicInteger(0)
-    // 串行合成队列：所有合成请求依序执行，绝不并发/互相打断（修复连续请求导致的中断失败）
-    // @Volatile 可变引用：onStop() 需要能安全替换为新建队列，丢弃积压任务
-    @Volatile
-    private var synthExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "mtts-tts-synth").apply { isDaemon = true }
-    }
-    // 停止标记：外部 App 停止朗读/翻页（onStop）后置 true，当前任务在段边界快速退出
+    // ★ 队列架构（对齐 MultiTTS）：不自建任务队列，onSynthesizeText 直接在框架合成线程上同步执行。
+    //   排队/串行/停止清队全部由 Android TTS 框架管理——框架收到 TextToSpeech.stop() 时
+    //   会回调 onStop() 并清空自己的待处理队列；自建队列反而框架管不到，积压请求会继续跑完。
+    // 停止标记：onStop/onDestroy 置 true，当前任务在段边界快速退出
     @Volatile
     private var stoppedFlag = false
 
     // ★ 段合成共享线程池（原每段新建 SingleThreadExecutor 且不关闭 → 线程泄漏）
-    private val synthPool = java.util.concurrent.Executors.newFixedThreadPool(2) { r ->
+    //   @Volatile 可变：onDestroy/onStop 后若外部 App 立刻又 speak()，需要原地重建
+    @Volatile
+    private var synthPool = java.util.concurrent.Executors.newFixedThreadPool(2) { r ->
         Thread(r, "mtts-seg-synth").apply { isDaemon = true }
     }
     // ★ 代际号：onStop() 递增；每个请求在入队时捕获代际，旧队列任务不能冒充新请求。
     @Volatile
     private var generation = 0
     private val requestStateLock = Any()
+
+    // ★ 音效误触发抑制（与 MainViewModel 保持一致的参数）
+    private val tsRandom = java.util.Random()
+    private val TS_SFX_SINGLE_CHAR_PROB = 0.35f
+    private val TS_SFX_MULTI_CHAR_PROB = 0.65f
+    private val TS_SFX_REPEAT_WINDOW_MS = 4000L
+    private val TS_SFX_KW_REPEAT_WINDOW_MS = 6000L
+        private val tsLastSfxPlayAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val tsLastKwTriggerAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    // ★ 防回环静默：连续空音频请求计数（≥3 视为引擎故障，上报 error 让外部 App 停止翻页）
+    @Volatile
+    private var consecutiveEmptyReqs = 0
+
+    /** 判断单字关键词所在的字符位（charIdx）是否处于某个反屏蔽词内部（TtsService 侧） */
+    private fun isInBlockedWordTs(raw: String, charIdx: Int, blockedWords: List<String>): Boolean {
+        for (w in blockedWords) {
+            if (w.length <= 1) continue
+            var i = raw.indexOf(w)
+            while (i >= 0) {
+                if (charIdx >= i && charIdx < i + w.length) return true
+                i = raw.indexOf(w, i + w.length)
+            }
+        }
+        return false
+    }
 
     // ★ 发热修复：WakeLock 按需获取（合成开始 acquire、完成/停止/异常 release）。
     //   WifiLock 已移除：所有引擎均为离线引擎，合成不需要网络，WiFi 锁纯属白白阻止 WiFi 休眠。
@@ -91,6 +116,8 @@ class TtsService : TextToSpeechService() {
     /** 启动独立 BGM；准备过程不持锁，代际校验阻止 onStop 后迟到的播放器启动。 */
     private fun startBgmPlayer(requestGeneration: Int) {
         if (generation != requestGeneration) return
+        // ★ 用户已停止时不重启 BGM（防止 onDestroy/onStop 后外部 App 又 speak() 导致 BGM 复活）
+        if (userStopped) return
         if (!AppPrefs.isBgmEnabled()) { stopBgmPlayer(requestGeneration); return }
         val path = AppPrefs.getBgmPath()
         if (path.isBlank()) { stopBgmPlayer(requestGeneration); return }
@@ -182,6 +209,14 @@ class TtsService : TextToSpeechService() {
             android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
         // ★ WakeLock 超时 5 分钟（单次合成最多几十秒，5 分钟足够兜底；旧值 20 分钟过长）
         private const val WAKE_LOCK_TIMEOUT_MS = 300_000L
+
+        // ★ BGM 复活修复：跨实例持久化停止标志。
+        //   onDestroy 后服务被重建，实例变量丢失 → 新实例 userStopped=false → BGM 复活。
+        //   放 companion object 里，新旧实例共享同一份标志。
+        @Volatile
+        private var userStopped = false
+        @Volatile
+        private var lastStopTime = 0L
     }
 
     /** 当前已注册的全部引擎（微软内置恒在 + 已导入的外部语音包引擎） */
@@ -378,12 +413,18 @@ class TtsService : TextToSpeechService() {
 
     override fun onDestroy() {
         MttsLog.d(TAG, "onDestroy")
-        releaseLocks()
+        // ★ 与 onStop 同等处理：递增代际 + shutdownNow + 替换队列，
+        //   否则 onDestroy 后外部 App 立刻又 speak() → 旧 synthExecutor 已 shutdown → RejectedExecutionException → 静默丢弃
+        synchronized(requestStateLock) {
+            stoppedFlag = true
+            userStopped = true
+            lastStopTime = android.os.SystemClock.elapsedRealtime()
+            generation++
+            stopBgmPlayer()
+            releaseLocks()
+            synthPool.shutdownNow()
+        }
         try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
-        // 释放串行合成队列（允许正在执行的任务自然完成，丢弃排队中的新任务）
-        synthExecutor.shutdown()
-        synthPool.shutdownNow()
-        stopBgmPlayer()
         super.onDestroy()
     }
 
@@ -516,6 +557,16 @@ class TtsService : TextToSpeechService() {
             return
         }
 
+        // ★ BGM 复活修复：onStop/onDestroy 后外部 App 可能立刻又 speak()（翻页/续读）。
+        //   翻页间隔通常 <1s，新朗读间隔 >2s。超过 2s 的重新 speak 视为新朗读，允许 BGM 重启。
+        if (userStopped) {
+            val sinceStop = android.os.SystemClock.elapsedRealtime() - lastStopTime
+            if (sinceStop > 2000) {
+                userStopped = false
+                MttsLog.d(TAG, "userStopped reset (new speech after ${sinceStop}ms)")
+            }
+        }
+
         // ★ 轻量参数提取（纯内存操作，框架线程立即返回，不阻塞系统 TTS 调度）。
         //   耗时处理（音色路由 / 预处理 / 对话分段 / 合成）全部在 synthExecutor 工作线程执行，
         //   避免外部 App speak() 等待 onStart 回调超时 → 整套文本重发 → 队列积压 → 听感"循环读"。
@@ -525,20 +576,26 @@ class TtsService : TextToSpeechService() {
         val pitchRaw = request.pitch
         val useExternal = AppPrefs.isExternalParamsEnabled()
 
-        val submitted = synchronized(requestStateLock) { generation to synthExecutor }
-        runCatching { submitted.second.execute {
-            val myGen = submitted.first
-            val canStart = synchronized(requestStateLock) {
-                if (generation != myGen) false
-                else {
-                    stoppedFlag = false
-                    true
+        // ★ 队列优化：不再入自建队列，直接在框架合成线程同步执行（排队/串行由框架管理）。
+        //   段合成池若被 onStop/onDestroy 关闭（防重入），原地重建即可——本请求的合成仍需它。
+        synchronized(requestStateLock) {
+            if (synthPool.isShutdown) {
+                MttsLog.w(TAG, "synthPool was shutdown, rebuilding...")
+                synthPool = java.util.concurrent.Executors.newFixedThreadPool(2) { r ->
+                    Thread(r, "mtts-seg-synth").apply { isDaemon = true }
                 }
             }
-            if (!canStart) return@execute
-            var started = false
-            var hasSpeechAudio = false
-            var bgmHadError = false
+        }
+        val myGen = synchronized(requestStateLock) {
+            generation
+        }
+        // ★ 新请求开始：复位停止标记（仅当代际一致——onStop 已递增过代际的旧请求不在此列，
+        //   它们靠 generation != myGen 退出；否则停止后所有新请求都会被残留的 stoppedFlag 秒杀，
+        //   外部 App 重发 → 立即中断 → 再重发 → 请求洪水）。
+        if (generation == myGen) stoppedFlag = false
+        var started = false
+        var hasSpeechAudio = false
+        var bgmHadError = false
             // ★ 每个请求分配唯一序号 #N，贯穿本章内所有日志，便于按请求追踪生命周期
             val reqNo = reqCounter.incrementAndGet()
             // ★ 音效：同步最新配置到 SoundEffectManager（BGM/音效开关、音量、注册表）
@@ -582,7 +639,7 @@ class TtsService : TextToSpeechService() {
                     MttsLog.w(TAG, "REQ #$reqNo ✗ 无可用引擎")
                     bgmHadError = true
                     if (callback.start(24000, AudioFormat.ENCODING_PCM_16BIT, 1) == TextToSpeech.SUCCESS) callback.error()
-                    return@execute
+                    return
                 }
                 val finalVoice = voiceName.ifBlank {
                     com.mtts.app.util.TtsVoicesCache.get(targetEngine).firstOrNull()?.shortName
@@ -594,21 +651,66 @@ class TtsService : TextToSpeechService() {
                 val txt = rawText
                 val result = TextPreprocessor.process(txt)
                 // ★ 音效：关键词触发 → 自动注入 ⟨sfx:名字⟩ 标记（在关键词处）
+                //    与 MainViewModel 的 effectiveSfxNames/At 保持一致的抑制逻辑：
+                //    最长优先 + 反屏蔽词（单字）+ 关键词冷静期 + 随机概率 + 音效冷静期
                 val text0 = result.text
                 val text = if (AppPrefs.isSfxEnabled()) {
                     var t = text0
-                    val rnd = java.util.Random()
-                    // 关键词 → 候选池（同名关键词可能对应多个音效），随机选一个，不锁死同一个声音
+                    val sfxMap = AppPrefs.loadSfxMap().toMap()
+                    SoundEffectManager.sfxMap = sfxMap
+                    val rnd = tsRandom  // 共享实例
+                    val blockedWords = AppPrefs.loadSfxBlockedWords()
                     val pool = HashMap<String, MutableList<String>>()
                     for ((kw, name) in AppPrefs.loadSfxKeywords()) {
-                        if (kw.isNotBlank() && SoundEffectManager.sfxMap.containsKey(name)) {
+                        if (kw.isNotBlank() && sfxMap.containsKey(name)) {
                             pool.getOrPut(kw) { mutableListOf() }.add(name)
                         }
                     }
-                    for ((kw, cands) in pool) {
-                        if (t.contains(kw)) {
-                            val name = cands[rnd.nextInt(cands.size)]
-                            t = t.replace(kw, kw + TextPreprocessor.SFX_PREFIX + name + TextPreprocessor.SFX_SUFFIX)
+                    // 按关键词长度降序（最长优先）
+                    val sortedKws = pool.keys.sortedByDescending { it.length }
+                    val occupied = BooleanArray(t.length) { false }
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    for (kw in sortedKws) {
+                        val cands = pool[kw] ?: continue
+                        val isSingle = kw.length == 1
+                        val prob = if (isSingle) TS_SFX_SINGLE_CHAR_PROB else TS_SFX_MULTI_CHAR_PROB
+                        var idx = t.indexOf(kw)
+                        while (idx >= 0) {
+                            // 位置占用检查
+                            var overlap = false
+                            for (i in idx until idx + kw.length) {
+                                if (i < occupied.size && occupied[i]) { overlap = true; break }
+                            }
+                            if (overlap) { idx = t.indexOf(kw, idx + kw.length); continue }
+                            // 反屏蔽词（仅单字）
+                            if (isSingle && isInBlockedWordTs(t, idx, blockedWords)) {
+                                idx = t.indexOf(kw, idx + kw.length); continue
+                            }
+                            // 关键词冷静期
+                            val kwLast = tsLastKwTriggerAt[kw] ?: 0L
+                            if (now - kwLast < TS_SFX_KW_REPEAT_WINDOW_MS) {
+                                idx = t.indexOf(kw, idx + kw.length); continue
+                            }
+                            // 随机概率
+                            if (rnd.nextFloat() > prob) {
+                                idx = t.indexOf(kw, idx + kw.length); continue
+                            }
+                            // 音效冷静期
+                            val pickName = cands[rnd.nextInt(cands.size)]
+                            val sfxLast = tsLastSfxPlayAt[pickName] ?: 0L
+                            if (now - sfxLast < TS_SFX_REPEAT_WINDOW_MS) {
+                                idx = t.indexOf(kw, idx + kw.length); continue
+                            }
+                            // 通过全部抑制 → 注入标记
+                            t = t.substring(0, idx) + kw + TextPreprocessor.SFX_PREFIX + pickName + TextPreprocessor.SFX_SUFFIX + t.substring(idx + kw.length)
+                            // 注意：注入后 t 长度变了，occupied 需要重建或偏移
+                            // 简化：标记占用区间（原始 kw 部分），注入的标记不参与后续 indexOf 匹配
+                            for (i in idx until idx + kw.length) {
+                                if (i < occupied.size) occupied[i] = true
+                            }
+                            tsLastKwTriggerAt[kw] = now
+                            tsLastSfxPlayAt[pickName] = now
+                            idx = t.indexOf(kw, idx + kw.length + TextPreprocessor.SFX_PREFIX.length + pickName.length + TextPreprocessor.SFX_SUFFIX.length)
                         }
                     }
                     t
@@ -686,7 +788,7 @@ class TtsService : TextToSpeechService() {
                         // 纯停顿段：直接写静音
                         for (ms in pauses) {
                             val sil = silencePcm(ms)
-                            if (!writeChunk(sil, 0, sil.size)) return@execute
+                            if (!writeChunk(sil, 0, sil.size)) return
                         }
                         continue
                     }
@@ -730,7 +832,7 @@ class TtsService : TextToSpeechService() {
                             // 已被停止：取消合成并立即退出本段（后台合成线程随后自然结束）
                             synthFuture.cancel(true)
                             MttsLog.w(TAG, "REQ #$reqNo ⏹ 合成等待中断（停止）")
-                            return@execute
+                            return
                         }
                         segPcm = try {
                             synthFuture.get(100, java.util.concurrent.TimeUnit.MILLISECONDS)
@@ -745,7 +847,7 @@ class TtsService : TextToSpeechService() {
                         // 空段：跳过音频但仍追加停顿静音（保持语流节奏）
                         for (ms in pauses) {
                             val sil = silencePcm(ms)
-                            if (!writeChunk(sil, 0, sil.size)) return@execute
+                            if (!writeChunk(sil, 0, sil.size)) return
                         }
                         continue
                     }
@@ -784,38 +886,58 @@ class TtsService : TextToSpeechService() {
                         pcmBytes
                     }
                     if (balanced.isNotEmpty()) {
-                        if (!writeChunk(balanced, 0, balanced.size)) return@execute
+                        if (!writeChunk(balanced, 0, balanced.size)) return
                         hasSpeechAudio = true
                     }
                     // 追加停顿静音
                     for (ms in pauses) {
                         val sil = silencePcm(ms)
-                        if (!writeChunk(sil, 0, sil.size)) return@execute
+                        if (!writeChunk(sil, 0, sil.size)) return
                     }
                 }
                 if (generation != myGen || stoppedFlag) {
                     MttsLog.w(TAG, "REQ #$reqNo ⏹ 请求结束前已停止，不报告正常完成")
-                    return@execute
+                    return
                 }
                 if (!hasSpeechAudio) {
-                    // 合成失败或 PCM 为空时，即使只输出了停顿静音，也不能报告朗读成功。
-                    MttsLog.w(TAG, "REQ #$reqNo ✗ 未输出任何语音（空/失败 PCM）")
-                    bgmHadError = true
+                    // ★ 空音频（如省略号→逗号后仍可能产出静音）：不当错误处理，
+                    //   不停 BGM，不调 callback.error()（否则外部 App 会重发请求导致死循环）。
+                    //   正常 done 让外部 App 翻页继续下一句。
+                    // ★★ 防回环静默：断网/引擎故障时每句都空 → done → 外部 App 翻页 → 又空 →
+                    //   又 done …… 整本书被无声快速翻完。连续 ≥3 句空音频改报 error 让外部 App 停止。
+                    consecutiveEmptyReqs++
+                    MttsLog.w(TAG, "REQ #$reqNo ✗ 未输出任何语音 → 静默完成，不停 BGM (连续空=$consecutiveEmptyReqs)")
                     if (!started) {
                         if (callback.start(24000, AudioFormat.ENCODING_PCM_16BIT, 1) != TextToSpeech.SUCCESS) {
-                            return@execute
+                            return
                         }
                         started = true
                     }
-                    callback.error()
-                    return@execute
+                    if (consecutiveEmptyReqs >= 3) {
+                        MttsLog.e(TAG, "REQ #$reqNo ✗✗ 连续 $consecutiveEmptyReqs 句空音频，疑似引擎故障 → 上报 error")
+                        consecutiveEmptyReqs = 0
+                        bgmHadError = true
+                        callback.error()
+                        return
+                    }
+                    callback.done()
+                    return
                 }
+                consecutiveEmptyReqs = 0
                 MttsLog.i(TAG, "REQ #$reqNo done  bytes=$totalBytes  " +
                         "dur=${totalBytes * 1000L / (24000 * 2L)}ms  voice=${engineForJob.code}:$finalVoice")
                 // 正常完成后 BGM 保持播放（外部朗读每句一次请求，跨句必须连续）；
                 // 由 onStop() 或异常/无语音路径（finally 的 bgmHadError）负责停止。
                 callback.done()
             } catch (e: Exception) {
+                // ★ RejectedExecutionException（synthPool 已 terminated，onDestroy 后外部 App 仍在发请求）
+                //   不当异常处理——不停 BGM，不调 callback.error()，直接静默退出
+if (e is java.util.concurrent.RejectedExecutionException) {
+                    MttsLog.w(TAG, "REQ #$reqNo ⏹ 合成线程池已关闭，静默丢弃 [$rawText]")
+                    try { if (started) callback.done() } catch (_: Throwable) {}
+                    return
+                }
+
                 MttsLog.e(TAG, "REQ #$reqNo ✗ 异常终止: ${e.message ?: "exception"} [$rawText]", e)
                 bgmHadError = true
                 try {
@@ -826,36 +948,23 @@ class TtsService : TextToSpeechService() {
                         callback.error()
                     }
                 } catch (_: Throwable) {}
-            } finally {
-                // 合成完成/异常/停止后立即释放锁；异常与无语音路径的 BGM 在此收尾。
-                if (bgmHadError) stopBgmPlayer(myGen)
-                releaseLocks(myGen)
-            }
-        } }.onFailure { MttsLog.w(TAG, "synthesis request dropped during stop") }
+        } finally {
+            // 合成完成/异常/停止后立即释放锁；异常与无语音路径的 BGM 在此收尾。
+            if (bgmHadError) stopBgmPlayer(myGen)
+            releaseLocks(myGen)
+        }
     }
 
     override fun onStop() {
-        MttsLog.i(TAG, "STOP 收到外部停止/翻页 → 丢弃排队任务")
-        // ★ 修复循环读：
-        //   外部 App 停止朗读/翻页时框架会回调 onStop()。此前为空实现，
-        //   串行队列里积压的旧请求（因框架线程阻塞超时重发堆积）会继续一个个播完，
-        //   听感上就是同一段文字被反复朗读。
-        //   现在：
-        //   1) shutdownNow() 丢弃排队中的任务；
-        //   2) 正在执行的任务通过 stoppedFlag 在段边界快速退出（不打断正在写出的音频块，
-        //      避免 AudioTrack 状态错乱）；
-        //   3) 立刻替换为全新队列，保证后续新朗读请求正常入队执行。
+        MttsLog.i(TAG, "STOP 收到外部停止 → 代际递增 + 停 BGM + 释放锁（队列清空由框架负责）")
         synchronized(requestStateLock) {
             stoppedFlag = true
-            // 代际在请求提交时捕获；递增并替换队列，使已提交旧任务不能冒充新请求。
+            userStopped = true
+            lastStopTime = android.os.SystemClock.elapsedRealtime()
             generation++
             stopBgmPlayer()
             releaseLocks()
-            val old = synthExecutor
-            old.shutdownNow()
-            synthExecutor = Executors.newSingleThreadExecutor { r ->
-                Thread(r, "mtts-tts-synth").apply { isDaemon = true }
-            }
+            synthPool.shutdownNow()
         }
     }
 }

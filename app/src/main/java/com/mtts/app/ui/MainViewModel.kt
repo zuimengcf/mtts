@@ -517,32 +517,63 @@ class MainViewModel : ViewModel() {
             try {
                 withContext(Dispatchers.IO) {
                     startBgmLoop()
-                    // 1) 一次性合成完整 PCM（16bit / 单声道，引擎真实采样率：微软 24k / 搜狗百度 16k）
                     val (spd, vol, pit) = effectiveVoiceParams(engine, voice)
-                    // ★ 标记处理（停顿/音量/音调）：与 TtsService 一致，
-                    //   剥离 ⟨pause:ms⟩/⟨vol:x⟩/⟨pit:x⟩ 后再合成，避免标记被引擎当普通文本朗读
-                    val pauses = TextPreprocessor.extractPauses(text)
-                    val volMark = TextPreprocessor.extractVol(text)
-                    val pitMark = TextPreprocessor.extractPitchAdjust(text)
                     val clean = TextPreprocessor.stripAllMarkers(text)
-                    val effVol = (vol * volMark).coerceIn(0f, 2f)
-                    val effPit = (pit + pitMark).coerceIn(-1f, 1f)
-                    var pcm = synthesizeWithTimeout(engine, voice, spd, 1.0f, effPit, clean)
-                    if (pcm.isEmpty()) throw RuntimeException(str(R.string.err_no_audio))
-                    // ★ 峰值归一化音量均衡（保证各引擎在相同 UI 音量下听感一致）
-                    pcm = PcmResampler.balanceVolume16BitMono(pcm, effVol)
-                    // 追加停顿静音（按引擎真实采样率生成，与 PCM 同采样率）
-                    val silenceMs = pauses.sum()
-                    if (silenceMs > 0) {
-                        val rate = voiceSampleRate(voice, engine.code)
-                        val silence = ByteArray(rate * 2 * silenceMs / 1000)
-                        pcm = pcm + silence
-                    }
-                    MttsLog.d("Vm", "synthesize for play bytes=${pcm.size}")
+                    val effVol = vol.coerceIn(0f, 2f)
+                    val effPit = pit.coerceIn(-1f, 1f)
 
-                    // ★ 统一 24kHz 播放（playPcm 内部会把 16k 数据重采样到 24k）：
-                    //   本设备直接建 16kHz AudioTrack 会无声（playbackHeadPosition 冻结、write 无效），
-                    //   而 24kHz 一直正常。重采样后音调/语速不变、无杂音。
+                    // ★ 对话功能：分段 → 逐段合成（各角色音色）→ 拼接 PCM（对齐 TtsService 链路）
+                    val dialogSegs = com.mtts.app.util.DialogFeature.process(text, { ec ->
+                        val eng = EngineRegistry.get(ec)
+                        if (eng != null) com.mtts.app.util.TtsVoicesCache.get(eng) else emptyList()
+                    }, engine.code, voice)
+
+                    var pcm: ByteArray
+                    if (dialogSegs != null && dialogSegs.size > 1) {
+                        // 对话分段模式：逐段合成 + 拼接
+                        MttsLog.d("Vm", "playAudio dialog segments=${dialogSegs.size}")
+                        val parts = ArrayList<ByteArray>()
+                        for ((idx, seg) in dialogSegs.withIndex()) {
+                            if (stopRequested) break
+                            if (seg.text.isBlank()) continue
+                            val segClean = TextPreprocessor.stripAllMarkers(seg.text)
+                            if (segClean.isBlank()) continue
+                            val segEngine = EngineRegistry.get(seg.engineCode.ifBlank { engine.code }) ?: engine
+                            val segVoice = seg.voice.ifBlank { voice }
+                            val segSpd = (spd * seg.speed).coerceIn(0.25f, 4f)
+                            val segPit = (effPit + seg.pitch).coerceIn(-1f, 1f)
+                            MttsLog.d("Vm", "playAudio seg[${idx + 1}/${dialogSegs.size}] ${if (seg.isSpeech) "对白" else "旁白"} speaker=${seg.speaker} eng=${segEngine.code}:$segVoice text=${segClean.take(20)}")
+                            val segPcm = try {
+                                synthesizeWithTimeout(segEngine, segVoice, segSpd, 1.0f, segPit, segClean)
+                            } catch (e: Exception) {
+                                MttsLog.w("Vm", "playAudio seg[${idx + 1}] synth failed: ${e.message}")
+                                ByteArray(0)
+                            }
+                            if (segPcm.isNotEmpty()) {
+                                val segVol = (effVol * seg.volume).coerceIn(0f, 2f)
+                                parts.add(PcmResampler.balanceVolume16BitMono(segPcm, segVol))
+                            }
+                        }
+                        pcm = parts.fold(ByteArray(0)) { acc, b -> acc + b }
+                    } else {
+                        // 无对话分段（功能未开/单段）→ 原有逻辑
+                        val pauses = TextPreprocessor.extractPauses(text)
+                        val volMark = TextPreprocessor.extractVol(text)
+                        val pitMark = TextPreprocessor.extractPitchAdjust(text)
+                        val effVol2 = (vol * volMark).coerceIn(0f, 2f)
+                        val effPit2 = (pit + pitMark).coerceIn(-1f, 1f)
+                        pcm = synthesizeWithTimeout(engine, voice, spd, 1.0f, effPit2, clean)
+                        if (pcm.isEmpty()) throw RuntimeException(str(R.string.err_no_audio))
+                        pcm = PcmResampler.balanceVolume16BitMono(pcm, effVol2)
+                        val silenceMs = pauses.sum()
+                        if (silenceMs > 0) {
+                            val rate = voiceSampleRate(voice, engine.code)
+                            val silence = ByteArray(rate * 2 * silenceMs / 1000)
+                            pcm = pcm + silence
+                        }
+                    }
+                    if (pcm.isEmpty()) throw RuntimeException(str(R.string.err_no_audio))
+                    MttsLog.d("Vm", "synthesize for play bytes=${pcm.size}")
                     playPcm(pcm, voiceSampleRate(voice, engine.code), effectiveSfxAt(text))
                 }
                 stopBgmLoop()

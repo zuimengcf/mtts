@@ -1,6 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- 系统级 TTS 引擎声明：
      声明本应用提供 Android 全局语音合成服务，可被系统设置选为默认 TTS 引擎。
-     settingsActivity 指向 mtts 主界面（用户可在此管理音色/导入语音包）。 -->
+     settingsActivity 指向 mtts 主界面（用户可在此管理音色/导入语音包）。
+     ★ locales：必须声明引擎支持的语言，否则系统认为引擎不支持任何语言，
+       外部 App 调 setLanguage(Locale.CHINA) 时匹配不到可用音色。 -->
 <tts-engine xmlns:android="http://schemas.android.com/apk/res/android"
-    android:settingsActivity="com.mtts.app.ui.MainActivity" />
+    android:settingsActivity="com.mtts.app.ui.MainActivity">
+    <locales>
+        <locale android:name="zh-CN" />
+        <locale android:name="zh" />
+        <locale android:name="zh-Hans" />
+        <locale android:name="zh-Hans-CN" />
+        <locale android:name="en-US" />
+        <locale android:name="en" />
+    </locales>
+</tts-engine>

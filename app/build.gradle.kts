@@ -65,6 +65,12 @@ android {
         compose = true
     }
 
+    // release 构建不跑 lint（离线环境缺 lint-gradle 缓存；lint 由 CI/独立任务执行）
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
+    }
+
     packaging {
         jniLibs {
             // 搜狗离线 SDK 需要从磁盘读取真实 .so 文件路径（frontModel/service_url），
@@ -80,6 +86,12 @@ dependencies {
 
     // ★ 本地 libs 目录下的 jar（jieba-analysis 中文分词，说话人识别用）
     implementation(fileTree("libs") { include("*.jar") })
+
+    // ★ 微软官方 ONNX Runtime for Android（AI 人名识别 NER：bert-mini 量化模型推理）
+    //   走 Maven Central 官方依赖（避免 53MB AAR 二进制入库），自带 ai.onnxruntime Java API
+    //   + libonnxruntime.so + libonnxruntime4j_jni.so
+    //   ⚠️ 其 libonnxruntime.so 与现 jniLibs 内 sherpa 自带同名：jniLibs 已删除 sherpa 版，由本 AAR 提供唯一 1.30
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.30.0")
 
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-compose:1.9.3")

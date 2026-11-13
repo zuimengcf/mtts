@@ -63,6 +63,16 @@ class MttsApplication : Application() {
             isDaemon = true
         }.start()
 
+        // ★ NER 人名识别模型：不预热（省 12.6MB 常驻内存），只绑定 context，
+        //   首次朗读/「自动识别角色」时由 NerOnnx.persons() 懒加载，空闲 2 分钟自动释放。
+        //   失败不致命——说话人识别自动回退到 统计发现 + 称谓锚定（纯规则方案）。
+        try {
+            com.mtts.app.util.NerOnnx.attach(this)
+            MttsLog.d("App", "ner attached (lazy, no preload)")
+        } catch (t: Throwable) {
+            MttsLog.w("App", "ner attach failed: ${t.message}")
+        }
+
         // 后台预热 sherpa-onnx 引擎（若已导入模型）：52MB onnx 首次加载 + session 初始化耗时
         // 5~15s，必须提前到启动时，否则用户第一次点合成会卡很久。
         // 受设置开关控制（sherpa_warmup_enabled，默认开；关掉则首次合成时才加载）。

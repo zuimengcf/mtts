@@ -113,7 +113,10 @@ object FileLog {
     /** 朗读日志过滤：I/W/E 一律保留；D 级只保留 TTS 主流程与播放相关的 tag */
     private fun isSpeechLog(level: String, sub: String): Boolean {
         if (level != "D") return true
-        return sub == "Tts" || sub == "Vm" || sub == "BGM" || sub == "FileLog"
+        // ★ MttsLog.mirror 传过来的 sub 带 "mtts/" 前缀（"mtts/Tts"），必须先剥掉再匹配，
+        //   否则 D 级主流程行（seg[...]、bgm 等）全被过滤，朗读日志只剩 I/W 级、看不到真实分段音色
+        val s = sub.removePrefix("mtts/")
+        return s == "Tts" || s == "Vm" || s == "BGM" || s == "FileLog"
     }
 
     /** 读取今天的朗读日志（用户可读，默认展示） */

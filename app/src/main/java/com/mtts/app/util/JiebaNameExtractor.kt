@@ -57,7 +57,7 @@ object JiebaNameExtractor {
         "说", "问", "答", "道", "喊", "回", "叹", "叫", "嚷", "应", "开口", "轻语", "低语", "喃喃"
     )
 
-    /** 修饰词（人名与动词之间） */
+    /** 修饰词（人名与动词之间）——仅作句法位置剥离辅助，主力识别走统计 n-gram（discoverNamesByStats） */
     private val MODIFIERS = listOf(
         "忽然", "突然", "慢慢", "缓缓", "轻轻", "微微", "淡淡", "悄悄", "默默", "冷冷", "静静",
         "终于", "依旧", "仍然", "忽而", "似乎", "好像", "稍稍", "略微", "笑了笑", "冷笑", "苦笑",
@@ -115,7 +115,26 @@ object JiebaNameExtractor {
         val hit = knownNames.firstOrNull { s.startsWith(it) }
         if (hit != null) return hit
 
-        // 1) 剥离尾部说话动词
+        // 0) 剥离尾部标点：旁白段常形如 "林晚说：" / "周掌柜应道："（splitSegments 已剥离引号），
+        //    结尾标点会挡住后续说话动词剥离，必须先去掉。
+        s = s.trimEnd('：', ':', '，', ',', '。', '.', '！', '!', '？', '?', ' ', '　', '·', '…',
+            '\u201c', '\u201d', '\u2018', '\u2019', '「', '」', '『', '』')
+        if (s.isEmpty()) return ""
+
+        // 0.5) 若中间出现说话动词，截取动词前部分作为人名候选
+        //      "林晚说：澈澈点点头" → "林晚"（动词后是旁白/其它人，不可能是当前说话人）。
+        //      只取动词离开头较近的（≤8 字，人名+修饰词），避免长旁白误切。
+        var cutIdx = -1
+        for (v in SPEAK_VERBS) {
+            val i = s.indexOf(v)
+            if (i in 1..8 && (cutIdx < 0 || i < cutIdx)) cutIdx = i
+        }
+        if (cutIdx > 0) {
+            s = s.substring(0, cutIdx).trim()
+            if (s.isEmpty()) return ""
+        }
+
+        // 1) 剥离尾部说话动词（兜底：动词恰在末尾的情况）
         for (v in SPEAK_VERBS) {
             if (s.length > v.length && s.endsWith(v)) {
                 s = s.substring(0, s.length - v.length)

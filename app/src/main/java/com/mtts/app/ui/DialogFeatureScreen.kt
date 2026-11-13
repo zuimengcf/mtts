@@ -689,9 +689,13 @@ fun CharacterContent(vm: MainViewModel) {
                                 )
                             }
                             TextButton(onClick = { editingIdx = i; editing = c }) { Text("编辑") }
-                            TextButton(onClick = { save(characters.filterIndexed { j, _ -> j != i }) }) {
+TextButton(onClick = {
+                                // 删除角色时同步清掉抽象计数，防止朗读时残留计数导致角色自动复活
+                                com.mtts.app.util.AppPrefs.removeAbstractRole(c.name)
+                                save(characters.filterIndexed { j, _ -> j != i })
+                             }) {
                                 Text("删除", color = MaterialTheme.colorScheme.error)
-                            }
+                             }
                         }
                     }
                 }
@@ -702,15 +706,22 @@ fun CharacterContent(vm: MainViewModel) {
                     Spacer(Modifier.height(4.dp))
 Text("抽象角色（朗读积累中，满${HIGH_FREQ_THRESHOLD}次自动注册）",
                          style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                     abstractRoles.forEach { r ->
-                         Row(Modifier.fillMaxWidth().padding(vertical = 2.dp),
-                             verticalAlignment = Alignment.CenterVertically) {
-                             Text("${r.name}（${r.gender}）", Modifier.weight(1f),
-                                  style = MaterialTheme.typography.bodySmall)
-                             Text("${r.count}/${HIGH_FREQ_THRESHOLD}", style = MaterialTheme.typography.labelSmall,
-                                  color = if (r.count >= HIGH_FREQ_THRESHOLD) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary)
+abstractRoles.forEach { r ->
+                          Row(Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                              verticalAlignment = Alignment.CenterVertically) {
+                              Text("${r.name}（${r.gender}）", Modifier.weight(1f),
+                                   style = MaterialTheme.typography.bodySmall)
+                              Text("${r.count}/${HIGH_FREQ_THRESHOLD}", style = MaterialTheme.typography.labelSmall,
+                                   color = if (r.count >= HIGH_FREQ_THRESHOLD) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary)
+                              // 删除抽象角色（清掉累计计数，杜绝该说话人因残留计数再自动注册）
+                              IconButton(onClick = {
+                                  com.mtts.app.util.AppPrefs.removeAbstractRole(r.name)
+                                  abstractRoles = abstractRoles.filterNot { it.name == r.name }
+                              }) {
+                                  Icon(Icons.Default.Delete, "删除", tint = MaterialTheme.colorScheme.error)
+                              }
                         }
-                    }
+                     }
                 }
                 TextButton(onClick = {
                     editingIdx = -1
@@ -800,6 +811,24 @@ Text("抽象角色（朗读积累中，满${HIGH_FREQ_THRESHOLD}次自动注册�
                         value = detectText, onValueChange = { detectText = it },
                         label = { Text("小说文本") }, minLines = 5, maxLines = 8,
                         modifier = Modifier.fillMaxWidth()
+                    )
+                    // ★ NER 模型状态（一眼看出加载成败；懒加载：首次识别时才自动加载）
+                    val nerState = com.mtts.app.util.NerOnnx.loadState
+                    val nerErr = com.mtts.app.util.NerOnnx.loadError
+                    val nerMs = com.mtts.app.util.NerOnnx.loadMs
+                    val nerOk = com.mtts.app.util.NerOnnx.isReady
+                    Text(
+                        when {
+                            nerOk -> "模型识别：已就绪（${nerMs}ms）"
+                            nerState == "失败" -> "模型识别：加载失败（${nerErr ?: "未知原因"}），将只用规则识别"
+                            nerState == "加载中…" -> "模型识别：加载中…"
+                            nerState.startsWith("已释放") -> "模型识别：已释放（识别时自动重新加载）"
+                            else -> "模型识别：未加载（识别时自动加载，空闲 2 分钟自动释放）"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (nerOk) MaterialTheme.colorScheme.primary
+                                else if (nerState == "失败") MaterialTheme.colorScheme.error
+                                else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     if (detectMsg.isNotBlank()) {
                         Text(detectMsg, style = MaterialTheme.typography.bodySmall,

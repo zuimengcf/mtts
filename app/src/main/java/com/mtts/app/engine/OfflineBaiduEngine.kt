@@ -284,15 +284,15 @@ class OfflineBaiduEngine : TtsEngine {
 
             // 2) 设置参数（复刻 Q1/A.a()：速度/音量/风格等）
             //   Q1/k 默认 a(速度)=b(音高)=c(音量)=5.0(f)（0-10 范围）；MultiTTS 对各厂商引擎用"5 居中"比例。
-            //   6082724/90013 引擎实测 param=5.0 可正常合成；传入 config 比例(如 volume=1.0)会越界(ret=8)。
-            //   现按语音包/用户设置的相对值映射：base(5.0) × rel，夹在 [0,10]。
-            //   rel 来源优先级：合成时传入的 speed/volume/pitch → 未传(默认1.0/0.0)则用 config 音色自带值。
             //
-            // ★ 50-50-25 基准统一：
-            //   - 语速/音量：内部浮点（1.0=UI50 基准）→ param = 5.0 × rel（rel=1.0 → 5 中间值）
-            //     用户设 speed=1.5（UI75）→ 7.5；speed=0.5（UI25）→ 2.5
-            //   - 音调：内部浮点（0=UI25 基准）→ param = 5.0 + pitch×5.0（pitch=0 → 5 中间值）
-            //     用户设 pitch=1.0（UI50）→ 10（最高）；pitch=-1.0（UI1）→ 0（最低）
+            // ★ 百度基准 = 满格 10（用户真机实测）：百度 90013 系（js/jinsha/bufeiyan 等）语速/音量
+            //   必须「拉满」才与微软等其它引擎的默认听感一致——旧映射 5.0×rel（rel=1.0 → 5.0 中间值）
+            //   输出只有一半语速/音量，对白段（百度）明显「又慢又轻」。
+            //   改为 10.0×rel：
+            //   - rel=1.0（UI 50 基准）→ 10.0 满格（正常）
+            //   - rel=0.5（UI 25）→ 5.0（半速/半音量）
+            //   - rel=1.5（UI 75）→ 截断 10.0（百度满格即上限）
+            //   - 音调保持 5.0 + pitch×5.0（0 基准=5 中间值，用户未反馈异常）
             val relSpeed = if (speed > 0f && speed != 1.0f) speed else speakerSpeed
             // ★ 音量修复（HTTP 实测）：百度 SDK bdTTSSetParamFloat(handle,1,volF=5.0×rel) 完美线性
             //   （rel 0.4→volF2.0/peak 8711、1.8→volF9.0/peak 22402，单调递增无死区）。
@@ -302,7 +302,8 @@ class OfflineBaiduEngine : TtsEngine {
             //   已按 per-voice→全局→config 回退链给出最终值），彻底消除错误继承。
             val relVolume = if (volume > 0f) volume else 1.0f
             val relPitch = pitch
-            fun baiduParam(rel: Float): Float = (5.0f * rel).coerceIn(0f, 10f)
+            // ★ 百度满格基准（用户实测）：语速/音量拉满（10.0）才是正常听感
+            fun baiduParam(rel: Float): Float = (10.0f * rel).coerceIn(0f, 10f)
             val volF = baiduParam(relVolume)
             val spdF = baiduParam(relSpeed)
             val pitF = ((5.0f + relPitch * 5.0f)).coerceIn(0f, 10f)

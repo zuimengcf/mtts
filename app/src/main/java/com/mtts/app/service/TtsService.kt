@@ -103,6 +103,22 @@ class TtsService : TextToSpeechService() {
     private val wakeLockLock = Any()
     private var wakeLockGeneration = -1
 
+    // ★ 外部参数自适应锚点（用户规则：首次收到的值=基准 1x，之后按相对变化调整）
+    //   不猜外部语义（200/0.5/100 一律首次锚定为基准=1x），外部怎么调我们按 当前值/基准 跟着调
+    @Volatile private var extRateBase = 0f
+    @Volatile private var extVolBase = 0f
+    @Volatile private var extPitchBase = 0f
+    private val paramBaseLock = Any()
+
+    /** 首次收到外部参数时锚定基准（并发安全，只锚一次） */
+    private fun anchorExternalParams(rate: Float, vol: Float, pitch: Float) {
+        synchronized(paramBaseLock) {
+            if (extRateBase <= 0f && rate > 0f) extRateBase = rate
+            if (extVolBase <= 0f && vol > 0f) extVolBase = vol
+            if (extPitchBase <= 0f && pitch > 0f) extPitchBase = pitch
+        }
+    }
+
     // ★ BGM：独立 MediaPlayer（与语音 PCM 管线解耦，系统混音器并行输出）。
     //   原逐句 PCM 混入方案会在首段混音时同步整首解码（44.1kHz 源可拖 18 秒+），
     //   直接卡死输出线程 → 外部调用第一句长时间无声。
@@ -611,14 +627,26 @@ class TtsService : TextToSpeechService() {
                 // ★ BGM：prepare 在后台队列线程做；代际失效时不会在 onStop 后迟到启动。
                 startBgmPlayer(myGen)
                 // ★ 延时路由 + 预处理全部移到工作线程（框架线程已立即返回，不再阻塞）
-                // 系统语速：仅当"使用外部参数"开关打开时才采用。此时按 ColorOS/OPPO 中间刻度归一：
-                //   系统语速条"中间"底层约 292~300（非标，安卓标准 100=1x），我们以 300=1x 对齐，
-                //   即系统 300 ↔ 我们 UI 中间刻度 50（1x）。若按 100=1x 会把 600 放大成 6x（外部 App 变快）。
-                // 默认开关为 false，外部 App 调用走下方 appSpeed（app 全局语速，默认 1x），不受系统 rate 影响。
-                val speed = (rate / 300f).coerceIn(0.25f, 4f)
-                val volumeNorm = if (volumeRaw > 1.5f) volumeRaw / 100f else volumeRaw
-                val volume = if (volumeNorm <= 0f) 1f else volumeNorm.coerceIn(0f, 2f)
-                val pitch = ((pitchRaw - 100) / 100f).coerceIn(-1f, 1f)
+                // ★ 外部参数自适应（用户规则：不猜语义，锚定基准后按相对变化跟随）
+                //   首条规则：无论外部初始参数是什么（200/0.5/100/…），首次收到的值 = 基准 1x，正常输出；
+                //   外部之后有调整 → 我们按 当前值/基准 跟着调（语速/音量/音调三条都如此）。
+                anchorExternalParams(rate.toFloat(), volumeRaw, pitchRaw.toFloat())
+                // 语速：纯比值（首次任意值=1x；之后按相对比例走）
+                val speed = if (useExternal && extRateBase > 0f)
+                                (rate / extRateBase).coerceIn(0.25f, 4f)
+                            else (rate / 100f).coerceIn(0.25f, 4f)
+                // 音量：同样纯比值（首次任意值=1x 基准；外部调到 1.5x 我们就 1.5x）
+                //   100 分制与 0..1 float 制都兼容（比值与单位无关）
+                val volume = if (useExternal && extVolBase > 0f && volumeRaw > 0f)
+                                (volumeRaw / extVolBase).coerceIn(0f, 2f)
+                            else {
+                                val volumeNorm = if (volumeRaw > 1.5f) volumeRaw / 100f else volumeRaw
+                                if (volumeNorm <= 0f) 1f else volumeNorm.coerceIn(0f, 2f)
+                            }
+                // 音调：同样锚定 -> 倍率（首次=0 基准；外部调到 1.2x → +0.2）
+                val pitch = if (useExternal && extPitchBase > 0f)
+                                ((pitchRaw / extPitchBase) - 1f).coerceIn(-1f, 1f)
+                            else ((pitchRaw - 100) / 100f).coerceIn(-1f, 1f)
                 val appSpeed = AppPrefs.getGlobalSpeed() ?: 1f
                 val appPitch = AppPrefs.getGlobalPitch() ?: 0f
                 val appVolume = AppPrefs.getGlobalVolume() ?: 1f
@@ -809,10 +837,15 @@ class TtsService : TextToSpeechService() {
                         }
                     }
 
+                    // ★ 日志文本：写入完整 cleanText（不再 take(24) 截断），
+                    //   转义反斜杠/引号/换行，避免文本内引号破坏 "text=..." 格式
+                    val logText = cleanText.replace("\\", "\\\\")
+                        .replace("\"", "\\\"")
+                        .replace("\r", " ").replace("\n", " ")
                     MttsLog.d(TAG, "REQ #$reqNo seg[${idx + 1}/${dialogue.size}] ${if (seg.isSpeech) "对白" else "旁白"} " +
                             "speaker=${seg.speaker}  eng=${segEngine.code}:$segVoice  " +
                             "speed=${"%.2f".format(segSpeed)} vol=${"%.2f".format(segVolume)} pitch=${"%.2f".format(segPitch)}  " +
-                            "text=\"${cleanText.take(24)}\"")
+                            "text=\"$logText\"")
 
                     // ★ 停止秒断：合成用 Future 包裹，停止时不再干等当前段合成完（原 runBlocking 会阻塞到合成结束，
                     //   微软引擎一段要 1~2s，stop 后"还在念"的残留全来自这里）。

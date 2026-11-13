@@ -27,3 +27,7 @@ keystore/
 *.keystore
 keystore.properties
 lineage.bin
+__pycache__/
+*.pyc
+*.pyo
+

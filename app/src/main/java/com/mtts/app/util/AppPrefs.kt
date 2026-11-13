@@ -292,6 +292,13 @@ object AppPrefs {
         return out
     }
 
+    /** 删除抽象角色（及其累计计数），保证该说话人不会因残留计数再次自动注册 */
+    fun removeAbstractRole(name: String) {
+        if (name.isBlank()) return
+        val roles = loadAbstractRoles().filterNot { it.name == name }
+        saveAbstractRoles(roles)
+    }
+
     /**
      * 朗读时对某说话人计数 +1；满 10 次自动注册为正式角色（按性别分组自动分配声音）。
      * 返回本次是否发生了"新注册"。
@@ -309,7 +316,7 @@ object AppPrefs {
         }
         val cur = roles.firstOrNull { it.name == name } ?: return false
         if (cur.count >= HIGH_FREQ_THRESHOLD) {
-            // 满 10 次 → 注册为正式角色（自动分配：按性别分组装载，未指定固定音色）
+            // ★ 满 5 次 → 注册为正式角色（自动分配：按性别分组装载，未指定固定音色）
             val chars = loadCharacters().toMutableList()
             if (chars.none { it.name == name }) {
                 chars.add(com.mtts.app.util.DialogCharacter(name = name, group = cur.gender, manual = false))

@@ -635,13 +635,19 @@ private fun LogsContent() {
     var fullMode by remember { mutableStateOf(false) }
     val fullLogEnabled = remember { mutableStateOf(com.mtts.app.util.AppPrefs.isFullLogEnabled()) }
 
-    // 读取当前通道日志（IO 线程），倒序显示：最新在最上
+    // 读取当前通道日志（IO 线程）；完整日志倒序显示（最新在上），朗读日志正序交给解析器聚合
     fun load() {
         scope.launch {
             val text = withContext(Dispatchers.IO) {
                 val raw = if (fullMode) com.mtts.app.util.FileLog.readTodayFull(ctx)
                           else com.mtts.app.util.FileLog.readTodaySpeech(ctx)
-                formatSpeechLog(raw.trim().lines().reversed().joinToString("\n"), fullMode)
+                if (fullMode) {
+                    // 完整日志：纯文本倒序（最新在最上）
+                    formatSpeechLog(raw.trim().lines().reversed().joinToString("\n"), fullMode)
+                } else {
+                    // 朗读日志：正序文本，parseSpeechEntries 内部聚合后再倒序（最新在最上）
+                    formatSpeechLog(raw.trim(), fullMode)
+                }
             }
             logText = text
         }
@@ -650,7 +656,7 @@ private fun LogsContent() {
     LaunchedEffect(Unit) { load() }
     LaunchedEffect(fullMode) { load() }
 
-    // 自动刷新：每 2 秒拉取一次（同样倒序显示）
+    // 自动刷新：每 2 秒拉取一次（完整日志倒序，朗读日志正序聚合）
     LaunchedEffect(autoRefresh, fullMode) {
         while (autoRefresh) {
             delay(2000)
@@ -658,7 +664,11 @@ private fun LogsContent() {
                 val text = withContext(Dispatchers.IO) {
                     val raw = if (fullMode) com.mtts.app.util.FileLog.readTodayFull(ctx)
                               else com.mtts.app.util.FileLog.readTodaySpeech(ctx)
-                    formatSpeechLog(raw.trim().lines().reversed().joinToString("\n"), fullMode)
+                    if (fullMode) {
+                        formatSpeechLog(raw.trim().lines().reversed().joinToString("\n"), fullMode)
+                    } else {
+                        formatSpeechLog(raw.trim(), fullMode)
+                    }
                 }
                 logText = text
             }
@@ -835,14 +845,12 @@ private fun LogsContent() {
                             shape = MaterialTheme.shapes.medium
                         ) {
                             Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
-                                // 主行：朗读文字（无则显示占位说明）
+                                // 主行：朗读文字（无则显示占位说明）——不限行数，完整展示，不截断
                                 Text(
                                     text = e.text.ifBlank { "（空文本请求）" },
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = if (e.isError) MaterialTheme.colorScheme.onErrorContainer
-                                            else MaterialTheme.colorScheme.onSurface,
-                                    maxLines = 3,
-                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                            else MaterialTheme.colorScheme.onSurface
                                 )
                                 Spacer(Modifier.height(2.dp))
                                 // 简略字段行：时间 状态 音色 耗时
@@ -870,32 +878,90 @@ private data class SpeechEntry(
 )
 
 /**
- * 把朗读日志行聚合为条目：以 "REQ #N start" 开新条目（主行取朗读文字），
- * 同一请求的后续行（done/警告/中断）追加为字段信息，不单独成卡。
+ * 把朗读日志聚合为卡片：
+ * - 有分段行（对话功能开启，合成被切开）→ 每段（对白/旁白）独立一张卡，
+ *   主行=该段朗读文字，字段=时间 + [对白/旁白] + 说话人 + 真实音色 + 结果；
+ *   start 行不单独成卡（第一个 seg 取代其占位），done/中断追加到最后一张段卡。
+ * - 无分段行（对话功能关闭，整段直读）→ 整段一张卡（start 行文本+默认音色）。
  */
 private fun parseSpeechEntries(text: String): List<SpeechEntry> {
-    data class Acc(val id: Long, val text: String, val fields: MutableList<String>, val isError: Boolean)
+    data class Acc(
+        val id: Long,
+        val text: String,
+        val fields: MutableList<String>,
+        val isError: Boolean
+    )
 
     val out = mutableListOf<Acc>()
     var seq = 0L
     val reqRe = Regex("""^(\d{2}:\d{2}:\d{2}\.\d{3})\s*·?\s*(?:ℹ|⚠|✗)?\s*(?:mtts/)*Tts:\s*REQ #(\d+) (start|done|✗|⏹)\s*(.*)$""")
-    val textRe = Regex("""text="([^"]*)"""")
-    val voiceRe = Regex("""voice=([\w:\-]+)""")
+    // ★ 分段行正则：seg[n/total] + 对白/旁白 + speaker + eng:voice
+    val segRe = Regex("""^(\d{2}:\d{2}:\d{2}\.\d{3})\s*·?\s*(?:mtts/)*Tts:\s*REQ #\d+ seg\[(\d+)/(\d+)\]\s*(对白|旁白)\s+speaker=(\S*)\s*eng=([\w.\-]+):([\w.\-+]+)""")
+    // ★ text="..." 支持转义序列（\\ \"）：写入侧已做完整文本+转义。
+    //   注意不能要求 text="..." 后跟空格（seg 行的 text 在行尾）。
+    val textRe = Regex("""text="((?:[^"\\]|\\.)*)" """.trimEnd())
     val bytesRe = Regex("""bytes=(\d+)""")
     val durRe = Regex("""dur=(\d+)ms""")
+
+    /** 反转义日志文本（\\ → \，\" → "） */
+    fun unescapeLog(s: String): String {
+        val sb = StringBuilder(s.length)
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            if (c == '\\' && i + 1 < s.length) {
+                sb.append(s[i + 1])
+                i += 2
+            } else { sb.append(c); i++ }
+        }
+        return sb.toString()
+    }
+
+    // 当前请求状态：start 占位卡下标、是否已有 seg 卡、最后一张 seg 卡下标
+    var startIdx = -1
+    var segAdded = false
+    var lastSegIdx = -1
 
     for (raw in text.lines()) {
         val line = raw.trim()
         if (line.isEmpty()) continue
+
+        // ★ 分段行优先：每段独立成卡
+        val sm = segRe.find(line)
+        if (sm != null) {
+            val segTime = sm.groupValues[1]
+            val segKind = sm.groupValues[4]
+            val spk = sm.groupValues[5]
+            val segEng = sm.groupValues[6]
+            val segVoice = sm.groupValues[7]
+            val t = unescapeLog(textRe.find(line)?.groupValues?.get(1) ?: "")
+            val fields = mutableListOf(segTime, "[$segKind]")
+            if (spk.isNotBlank() && spk != "-") fields.add(spk)
+            fields.add("$segEng:$segVoice")
+            if (!segAdded && startIdx >= 0 && startIdx < out.size) {
+                // 第一个 seg 取代 start 占位卡
+                out[startIdx] = Acc(seq++, t.ifBlank { "（空白段）" }, fields, false)
+                lastSegIdx = startIdx
+            } else {
+                out.add(Acc(seq++, t.ifBlank { "（空白段）" }, fields, false))
+                lastSegIdx = out.size - 1
+            }
+            segAdded = true
+            continue
+        }
+
         val m = reqRe.find(line)
         if (m != null) {
             val (time, reqNo, kind, rest) = m.destructured
             val isErr = kind == "✗" || line.contains("✗✗") || line.contains("异常终止")
             when (kind) {
                 "start" -> {
-                    val t = textRe.find(rest)?.groupValues?.get(1) ?: ""
-                    val voice = voiceRe.find(rest)?.groupValues?.get(1) ?: ""
-                    out.add(Acc(seq++, t, mutableListOf(time, voice), isErr))
+                    // 占位：有 seg 时被第一张段卡取代；无 seg 时保留为整段卡
+                    val t = unescapeLog(textRe.find(rest)?.groupValues?.get(1) ?: "")
+                    out.add(Acc(seq++, t, mutableListOf(time), isErr))
+                    startIdx = out.size - 1
+                    segAdded = false
+                    lastSegIdx = -1
                 }
                 "done" -> {
                     val bytes = bytesRe.find(rest)?.groupValues?.get(1)
@@ -905,32 +971,42 @@ private fun parseSpeechEntries(text: String): List<SpeechEntry> {
                         bytes?.let { append("  ${it}B") }
                         dur?.let { append("  ${it}ms") }
                     }
-                    if (out.isNotEmpty()) out.last().fields.add(f) else out.add(Acc(seq++, "", mutableListOf(time, f), isErr))
+                    val target = if (segAdded && lastSegIdx in out.indices) lastSegIdx
+                                 else if (startIdx in out.indices) startIdx
+                                 else -1
+                    if (target >= 0) out[target].fields.add(f)
+                    else out.add(Acc(seq++, "", mutableListOf(time, f), isErr))
                 }
                 else -> { // ✗ / ⏹ 异常或中断
                     val f = if (isErr) "失败" else "已停止"
-                    if (out.isNotEmpty()) {
-                        out.last().fields.add(f)
-                        if (isErr) out.last().fields.add(rest.take(40))
-                    } else {
-                        out.add(Acc(seq++, "", mutableListOf(time, f), isErr))
-                    }
+                    val target = if (segAdded && lastSegIdx in out.indices) lastSegIdx
+                                 else if (startIdx in out.indices) startIdx
+                                 else -1
+                    if (target >= 0) {
+                        out[target].fields.add(f)
+                        if (isErr) out[target].fields.add(rest.take(40))
+                    } else out.add(Acc(seq++, "", mutableListOf(time, f), isErr))
                 }
             }
-        } else {
-            // 非请求行（BGM/其它服务行）：仅当与最后条目同流时作为补充字段，否则跳过
-            if (out.isNotEmpty() && (line.contains("bgm player") || line.contains("STOP") || line.contains("onDestroy") || line.contains("onCreate"))) {
-                val tag = when {
-                    line.contains("bgm player start") -> "BGM 启动"
-                    line.contains("bgm player stop") -> "BGM 停止"
-                    line.contains("STOP") -> "外部停止"
-                    line.contains("onDestroy") -> "服务销毁"
-                    else -> "服务启动"
-                }
-                out.last().fields.add(tag)
+            continue
+        }
+
+        // 非请求行（BGM/STOP 等）→ 追加到最后一张卡（seg 卡优先，否则 start 卡）
+        if (line.contains("bgm player") || line.contains("STOP") || line.contains("onDestroy") || line.contains("onCreate")) {
+            val tag = when {
+                line.contains("bgm player start") -> "BGM 启动"
+                line.contains("bgm player stop") -> "BGM 停止"
+                line.contains("STOP") -> "外部停止"
+                line.contains("onDestroy") -> "服务销毁"
+                else -> "服务启动"
             }
+            val target = if (segAdded && lastSegIdx in out.indices) lastSegIdx
+                         else if (startIdx in out.indices) startIdx
+                         else out.size - 1
+            if (target in out.indices) out[target].fields.add(tag)
         }
     }
+
     return out.map { e ->
         SpeechEntry(e.id, e.text, e.fields.distinct().joinToString("  ·  "), e.isError)
     }.reversed()

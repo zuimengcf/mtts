@@ -624,8 +624,10 @@ object DialogFeature {
                         eng = ce
                         voice = cv
                         // 保留抽象积累（朗读满 10 次自动注册正式角色，由 UI/阈值统一管理）
-                        val gender = if (lastNarration.orEmpty().contains("他") &&
-                                        !lastNarration.orEmpty().contains("她")) "男" else "女"
+                        // ★ 性别推断：名称特征词优先（苍宫月→末字"月"=女），代词兜底（他多→男）
+                        val gender = genderByName(speaker)
+                            ?: if (lastNarration.orEmpty().contains("他") &&
+                                   !lastNarration.orEmpty().contains("她")) "男" else "女"
                         AppPrefs.bumpAbstractRole(speaker, gender)
                     }
                 } else {
@@ -767,11 +769,57 @@ object DialogFeature {
     }
 
     /**
-     * 完整性别判定（名称优先 → 代词兜底 → 默认女）
+     * ★ 完整性别判定（名称优先 → 代词兜底 → 默认女）
      */
     private fun guessGender(name: String, sheCount: Int, heCount: Int): String {
         genderByName(name)?.let { return it }
         return if (heCount > sheCount) "男" else "女"
+    }
+
+    /**
+     * ★ 人名子串去重：合并"苍宫月 / 苍宫"这类重叠识别结果，保留更长更完整的人名。
+     *
+     * 现象：NER 模型/统计发现/强格式提取可能同时产出「苍宫月」（完整 3 字）与「苍宫」
+     * （截断 2 字），旧逻辑把它们当作两个独立角色重复加入。这里对 names 做子串包含去重：
+     * 若短名是某个长名（长度 ≤ 4）的真子串，且短名长度 ≥ 2，则移除短名并把其计分并入长名。
+     *
+     * 注意：规则是「短名只并入**首个更长包含它的名字**」——被并入后短名不再独立输出；
+     * 长名本身若也被更长名包含，则递归并入（长名优先排序保证先处理更长者）。
+     *
+     * @return 去重后的 (name, mergedCount) 映射（短名已并入长名）
+     */
+    fun dedupeSubstringNames(countMap: Map<String, Int>): Map<String, Int> {
+        if (countMap.isEmpty()) return countMap
+        val names = countMap.keys.toMutableList()
+        // 长名优先：先处理更长的名字，保证"苍宫月"吸收"苍宫"而非反过来
+        names.sortByDescending { it.length }
+        // parent[name] = 该名字最终并入的长名（可能链式：苍宫→苍宫月→苍宫月（终））
+        val parent = HashMap<String, String>()
+        // 已被标记为"子串"的名字（不输出，计分并给 parent）
+        for (n in names) {
+            if (n in parent) continue           // 已被吸收
+            val cand = names.firstOrNull { m ->
+                m != n && n.length < m.length && m.length <= 4 && m.contains(n) && n.length >= 2
+            } ?: continue
+            parent[n] = cand
+        }
+        // 链式解析最终父名（苍宫→苍宫月；若苍宫月也被更长的包含则继续）
+        fun rootOf(n: String): String {
+            var cur = n
+            val seen = HashSet<String>()
+            while (true) {
+                if (!seen.add(cur)) break        // 防环
+                val p = parent[cur] ?: return cur
+                cur = p
+            }
+            return cur
+        }
+        val out = LinkedHashMap<String, Int>()
+        for (n in names) {
+            val root = rootOf(n)
+            out[root] = (out[root] ?: 0) + (countMap[n] ?: 0)
+        }
+        return out
     }
 
     /**
@@ -862,9 +910,14 @@ object DialogFeature {
             }
         }
         if (countMap.isEmpty()) return emptyList()
+        // ★ 人名子串去重：合并"苍宫月/苍宫"这类重叠识别结果（保留长名，计分累加）。
+        //   必须在代词性别统计**之前**做——合并后 tempChars 只含长名，
+        //   代词（她/他）计数全部归一到长名，性别判定一致（不会出现"苍宫"计到 0 次）。
+        val mergedMap = dedupeSubstringNames(countMap)
+        val mergedNames = mergedMap.keys.toMutableList()   // 已按长名优先排序
         // 2) 统计「她/他」推测性别
         val segs = splitSegments(text)
-        val tempChars = countMap.keys.map { DialogCharacter(name = it) }
+        val tempChars = mergedNames.map { DialogCharacter(name = it) }
         val she = HashMap<String, Int>()
         val he = HashMap<String, Int>()
         var lastNarration: String? = null
@@ -874,8 +927,8 @@ object DialogFeature {
             if (!seg.isSpeech) {
                 lastNarration = t
             } else {
-                // ★ 用全文人名池锚定（countMap 即池），动作描写引导的发言也能正确归属
-                val sp = identifySpeaker(lastNarration, tempChars, countMap.keys.toSet())
+                // ★ 用全文人名池锚定（mergedMap 即池），动作描写引导的发言也能正确归属
+                val sp = identifySpeaker(lastNarration, tempChars, mergedNames.toSet())
                 if (sp.isNotBlank()) {
                     val n = lastNarration.orEmpty()
                     if (n.contains("她")) she[sp] = (she[sp] ?: 0) + 1
@@ -885,17 +938,17 @@ object DialogFeature {
         }
         // 3) 组装结果：按出现次数（权重）降序排列，重复词优先
         val out = ArrayList<DetectedRole>()
-        val names = countMap.keys.toMutableList()
-        names.sortByDescending { countMap[it] ?: 0 }
+        val names = mergedNames.toMutableList()
+        names.sortByDescending { mergedMap[it] ?: 0 }
         for (n in names) {
             val s = she[n] ?: 0
             val h = he[n] ?: 0
             out.add(DetectedRole(
                 name = n,
                 rule = ruleMap[n] ?: "",
-                // ★ 性别判定：名称特征词优先（周掌柜→男、林晚→女），再代词兜底，最后默认女
+                // ★ 性别判定：名称特征词优先（周掌柜→男、林晚→女、苍宫月→月=女），再代词兜底，最后默认女
                 gender = guessGender(n, s, h),
-                count = countMap[n] ?: 1
+                count = mergedMap[n] ?: 1
             ))
         }
         return out

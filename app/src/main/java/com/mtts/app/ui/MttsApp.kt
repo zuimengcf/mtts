@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
@@ -407,6 +408,8 @@ private fun VoiceListView(vm: MainViewModel, uiState: EngineUiState) {
         mutedPairs.any { it.first == engineCode && it.second == v.shortName }
     // 底部折叠区展开状态
     var mutedExpanded by remember { mutableStateOf(false) }
+    // ★ 删除确认：待删除音色（非空=弹确认框），二次确认后才真正执行删除
+    var pendingDeleteVoice by remember { mutableStateOf<com.mtts.app.engine.Voice?>(null) }
 
     val all = uiState.voices
     // ★ 显示顺序：优先用户自定义顺序（拖动持久化），否则用引擎默认顺序
@@ -591,12 +594,41 @@ private fun VoiceListView(vm: MainViewModel, uiState: EngineUiState) {
                                 AppPrefs.saveMutedVoices(newPairs)
                                 mutedPairs = newPairs
                             },
+                            onDelete = {
+                                // ★ 二次确认：先记录待删音色，弹确认框，用户确认后才真正删除
+                                pendingDeleteVoice = voice
+                            },
                             modifier = Modifier
                         )
                     }
                 }
             }
         }
+    }
+
+    // ★ 删除二次确认对话框：点删除按钮后弹出，确认才执行
+    pendingDeleteVoice?.let { v ->
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { pendingDeleteVoice = null },
+            title = { Text("删除音色") },
+            text = {
+                Text(
+                    "确定要彻底删除音色「${v.name}」（${v.shortName}）吗？\n\n" +
+                    "语音包引擎会删除对应模型目录，删除后不可恢复（重新导入语音包可恢复）。"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.deleteVoice(uiState.currentEngine, v.shortName)
+                    // 刷新本地 muted 状态（deleteVoice 已清屏蔽记录 + refreshEngines 重扫音色）
+                    mutedPairs = AppPrefs.loadMutedVoices()
+                    pendingDeleteVoice = null
+                }) { Text("删除", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteVoice = null }) { Text("取消") }
+            }
+        )
     }
 }
 
@@ -689,6 +721,7 @@ private fun VoiceCard(
     vm: MainViewModel,
     muted: Boolean = false,
     onToggleMute: () -> Unit = {},
+    onDelete: (() -> Unit)? = null,   // 被屏蔽音色专属：彻底删除（语音包引擎删除模型，内置引擎仅清除屏蔽态）
     modifier: Modifier = Modifier
 ) {
     var showSettings by remember { mutableStateOf(false) }
@@ -798,6 +831,17 @@ private fun VoiceCard(
                                 else MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(22.dp)
                     )
+                }
+                // ===== 删除按钮（仅被屏蔽态显示；语音包引擎删模型，内置引擎清除屏蔽态） =====
+                if (muted && onDelete != null) {
+                    IconButton(onClick = onDelete, modifier = Modifier.size(40.dp)) {
+                        Icon(
+                            Icons.Default.Delete,
+                            contentDescription = "删除音色",
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
                 }
             }
             Spacer(Modifier.height(10.dp))

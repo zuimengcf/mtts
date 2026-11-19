@@ -390,6 +390,46 @@ class MainViewModel : ViewModel() {
         engine?.code?.let { AppPrefs.setSelectedVoice(it, voice) }
     }
 
+    /**
+     * 彻底删除一个音色（仅对离线语音包引擎有效；内置/在线引擎音色不可删，仅清除屏蔽态）。
+     * 操作：
+     *  ① 从被屏蔽列表移除该音色
+     *  ② 清除该音色的自定义参数与显示顺序残留
+     *  ③ 删除语音包模型目录（语音包引擎：voice/<engine>/<shortName> 或 sherpa 模型目录）
+     *  ④ 刷新引擎音色列表（listVoices 重扫后该音色消失）
+     */
+    fun deleteVoice(engine: TtsEngine?, voice: String) {
+        val ec = engine?.code ?: return
+        MttsLog.d("Vm", "deleteVoice", mapOf("engine" to ec, "voice" to voice))
+        // ★ 路径安全校验：voice 来自语音包 config.yaml（外部可控），
+        //   禁止路径分隔符/`.`/`..`，防止路径穿越删除 voice 根目录之外的文件。
+        if (voice.isBlank() || voice == "." || voice == ".." ||
+            voice.contains('/') || voice.contains('\\')
+        ) {
+            MttsLog.w("Vm", "deleteVoice rejected unsafe voice: $voice")
+            return
+        }
+        // ① 从被屏蔽列表移除
+        val pairs = AppPrefs.loadMutedVoices().filterNot { it.first == ec && it.second == voice }
+        AppPrefs.saveMutedVoices(pairs)
+        // ② 清除自定义参数 + 显示顺序残留
+        AppPrefs.clearVoiceParams(voice)
+        AppPrefs.saveVoiceOrder(ec, AppPrefs.loadVoiceOrder(ec)?.filterNot { it == voice } ?: emptyList())
+        // ③ 删除语音包模型目录（尽量删除；失败不阻塞流程）
+        runCatching {
+            val root = com.mtts.app.engine.VoicePackageManager.engineDir(ec) ?: return@runCatching
+            val target = java.io.File(root, voice).normalize()
+            // 双保险：确认目标仍在引擎目录内（normalize 后再次校验，防 `/`/`..` 变体穿越）
+            if (!target.absolutePath.startsWith(root.absolutePath + java.io.File.separator)) {
+                MttsLog.w("Vm", "deleteVoice rejected escape path: $target")
+                return@runCatching
+            }
+            if (target.isDirectory) target.deleteRecursively()
+        }
+        // ④ 刷新音色列表
+        refreshEngines()
+    }
+
     fun synthesize() {
         val state = _uiState.value
         val engine = state.currentEngine ?: return
@@ -542,6 +582,12 @@ class MainViewModel : ViewModel() {
                             val segVoice = seg.voice.ifBlank { voice }
                             val segSpd = (spd * seg.speed).coerceIn(0.25f, 4f)
                             val segPit = (effPit + seg.pitch).coerceIn(-1f, 1f)
+                            // ★ 对话声音变小修复：每段音量用「该段实际引擎/音色」的音量配置，
+                            //   而非主音色的 effVol——角色音色自定义了音量会被主音色覆盖导致音量错乱。
+                            val (_, segVolBase, _) = effectiveVoiceParams(
+                                segEngine, segVoice,
+                                com.mtts.app.util.TtsVoicesCache.get(segEngine)
+                            )
                             MttsLog.d("Vm", "playAudio seg[${idx + 1}/${dialogSegs.size}] ${if (seg.isSpeech) "对白" else "旁白"} speaker=${seg.speaker} eng=${segEngine.code}:$segVoice text=${segClean.take(20)}")
                             val segPcm = try {
                                 synthesizeWithTimeout(segEngine, segVoice, segSpd, 1.0f, segPit, segClean)
@@ -550,8 +596,11 @@ class MainViewModel : ViewModel() {
                                 ByteArray(0)
                             }
                             if (segPcm.isNotEmpty()) {
-                                val segVol = (effVol * seg.volume).coerceIn(0f, 2f)
-                                parts.add(PcmResampler.balanceVolume16BitMono(segPcm, segVol))
+                                val segVol = (segVolBase * seg.volume).coerceIn(0f, 2f)
+                                // ★ 多引擎对话归一化补偿：maxGain 放宽到 8.0（+18dB），
+                                //   低基准声级引擎（搜狗/百度 16kHz 输出峰值低）也能拉齐到 18000 目标峰值，
+                                //   避免对话中该角色声音明显小于满幅的微软段落（对话声音变小主因）。
+                                parts.add(PcmResampler.balanceVolume16BitMono(segPcm, segVol, maxGain = 8.0f))
                             }
                         }
                         pcm = parts.fold(ByteArray(0)) { acc, b -> acc + b }
@@ -1391,7 +1440,10 @@ class MainViewModel : ViewModel() {
                         }
                         consecutiveLineFailures = 0
                         // ★ 峰值归一化音量均衡
-                        pcm = PcmResampler.balanceVolume16BitMono(pcm, effVol)
+                        //   maxGain 放宽到 8.0（+18dB）：群聊多引擎角色混播时，
+                        //   低基准声级引擎（搜狗/百度 16kHz）也能拉齐到 18000 目标峰值，
+                        //   避免该角色声音明显小于满幅角色（对话声音变小主因）。
+                        pcm = PcmResampler.balanceVolume16BitMono(pcm, effVol, maxGain = 8.0f)
                         // 追加停顿静音（按引擎真实采样率生成，与 PCM 同采样率）
                         val silenceMs = pauses.sum()
                         if (silenceMs > 0) {

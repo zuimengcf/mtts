@@ -27,7 +27,6 @@ import com.mtts.app.util.AppPrefs
 import com.mtts.app.util.SoundEffectManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
-import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -49,8 +48,9 @@ import java.util.concurrent.Executors
  *  - startForeground：声明了 foregroundServiceType=mediaPlayback，startService 拉起须前台化
  */
 class TtsService : TextToSpeechService() {
-
     private val TAG = "Tts"
+    @Volatile
+    private var loadedLocale: TtsLocaleInfo? = null
     // 合成请求自增序号：每条请求一个 #N，贯穿其日志，便于按请求追踪生命周期
     private val reqCounter = java.util.concurrent.atomic.AtomicInteger(0)
     // ★ 队列架构（对齐 MultiTTS）：不自建任务队列，onSynthesizeText 直接在框架合成线程上同步执行。
@@ -128,6 +128,42 @@ class TtsService : TextToSpeechService() {
     private var bgmPlayerPath: String? = null
     private val bgmLock = Any()
     private var bgmPlayerGeneration = -1
+
+    // ★ BGM 空闲自动停止（根治"试听后 BGM 延迟关闭 / 外部朗读停发请求 BGM 不关"）：
+    //   不依赖 onStop()/GET_SAMPLE_TEXT 标志位（都可能不来/失效）。
+    //   每次合成请求完成时重置定时器；若超过 BGM_IDLE_TIMEOUT_MS 无新请求 → 自动停 BGM。
+    //   外部阅读器跨句朗读间隔通常 <3s，翻页连续；5s 空闲阈值足以区分"跨句"与"朗读结束"。
+    private val bgmIdleTimer = java.util.Timer("mtts-bgm-idle", true)
+    @Volatile
+    private var bgmIdleTask: java.util.TimerTask? = null
+
+    /** 重置 BGM 空闲定时器（每次合成请求完成时调用）：N 秒内无新请求则自动停 BGM。 */
+    private fun restartBgmIdleTimer(requestGeneration: Int, preview: Boolean) {
+        synchronized(bgmLock) {
+            bgmIdleTask?.cancel()
+            bgmIdleTask = null
+            // 只有 BGM 在播才需要兜底定时器；没播就不用
+            if (bgmPlayer == null) return
+        }
+        bgmIdleTask = object : java.util.TimerTask() {
+            override fun run() {
+                MttsLog.i(TAG, "BGM 空闲超时（" + BGM_IDLE_TIMEOUT_MS / 1000 + "s 无新请求）→ 自动停止" +
+                        if (preview) "（系统试听场景）" else "（外部朗读结束）")
+                stopBgmPlayer(requestGeneration)
+            }
+        }
+        try {
+            bgmIdleTimer.schedule(bgmIdleTask, BGM_IDLE_TIMEOUT_MS)
+        } catch (_: Throwable) {}
+    }
+
+    /** 取消 BGM 空闲定时器（onStop/onDestroy/stopBgmPlayer 时调用，避免定时器残留） */
+    private fun cancelBgmIdleTimer() {
+        synchronized(bgmLock) {
+            bgmIdleTask?.cancel()
+            bgmIdleTask = null
+        }
+    }
 
     /** 启动独立 BGM；准备过程不持锁，代际校验阻止 onStop 后迟到的播放器启动。 */
     private fun startBgmPlayer(requestGeneration: Int) {
@@ -225,6 +261,11 @@ class TtsService : TextToSpeechService() {
             android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
         // ★ WakeLock 超时 5 分钟（单次合成最多几十秒，5 分钟足够兜底；旧值 20 分钟过长）
         private const val WAKE_LOCK_TIMEOUT_MS = 300_000L
+
+        // ★ BGM 空闲自动停止阈值：最后一次合成完成后等待这么久，仍无新请求 → 自动停 BGM。
+        //   外部阅读器跨句朗读间隔通常 <3s（翻页连续）；5s 足以区分"跨句"与"朗读结束"。
+        //   onStop() 正常路径会立即停 BGM，此阈值只兜底"阅读器停发请求但未调 onStop()"的场景。
+        private const val BGM_IDLE_TIMEOUT_MS = 5_000L
 
         // ★ BGM 复活修复：跨实例持久化停止标志。
         //   onDestroy 后服务被重建，实例变量丢失 → 新实例 userStopped=false → BGM 复活。
@@ -436,6 +477,7 @@ class TtsService : TextToSpeechService() {
             userStopped = true
             lastStopTime = android.os.SystemClock.elapsedRealtime()
             generation++
+            cancelBgmIdleTimer()
             stopBgmPlayer()
             releaseLocks()
             synthPool.shutdownNow()
@@ -475,75 +517,89 @@ class TtsService : TextToSpeechService() {
     // ---------------- 系统 TTS 引擎回调 ----------------
 
     override fun onIsLanguageAvailable(lang: String, country: String, variant: String): Int =
-        TextToSpeech.LANG_AVAILABLE
+        TtsLocaleSupport.availability(lang, country, variant, availableLocales()).toAndroidStatus()
 
-    override fun onLoadLanguage(lang: String, country: String, variant: String): Int =
-        TextToSpeech.LANG_AVAILABLE
+    override fun onLoadLanguage(lang: String, country: String, variant: String): Int {
+        val available = availableLocales()
+        val status = TtsLocaleSupport.availability(lang, country, variant, available)
+        if (status != TtsLanguageAvailability.UNSUPPORTED) {
+            loadedLocale = TtsLocaleSupport.bestMatch(lang, country, variant, available)
+        }
+        return status.toAndroidStatus()
+    }
 
-    override fun onGetLanguage(): Array<String> = arrayOf("zh", "CN", "")
+    override fun onGetLanguage(): Array<String> {
+        val locale = loadedLocale ?: availableLocales().firstOrNull()
+        return if (locale == null) arrayOf("", "", "")
+        else arrayOf(locale.languageIso3, locale.countryIso3, locale.variant)
+    }
 
     override fun onGetDefaultVoiceNameFor(lang: String, country: String, variant: String): String {
-        // 默认音色：微软引擎第一个可用音色；缺省回退 zh-CN-YunxiNeural（走音色缓存）
-        val microsoft = engines.firstOrNull { it.code == "microsoft" }
-        val first = microsoft?.let { com.mtts.app.util.TtsVoicesCache.get(it).firstOrNull()?.shortName }
-        return first ?: "zh-CN-YunxiNeural"
+        val voices = TtsVoiceInventory.actualVoices()
+        val match = TtsLocaleSupport.bestMatch(lang, country, variant, voices.map { it.locale }.distinctBy { it.id })
+            ?: return ""
+        val voice = voices.firstOrNull { it.locale.id == match.id } ?: return ""
+        return "${voice.engineCode}:${voice.shortName}"
     }
 
     override fun onGetVoices(): MutableList<Voice> {
         val result = mutableListOf<Voice>()
-        if (engines.isEmpty()) {
-            MttsLog.w(TAG, "no engine registered")
+        val voices = TtsVoiceInventory.actualVoices()
+        if (voices.isEmpty()) {
+            MttsLog.w(TAG, "no voice with an available locale")
             return result
         }
-        for (engine in engines) {
-            try {
-                val voices = com.mtts.app.util.TtsVoicesCache.get(engine)
-                voices.forEach { v ->
-                    val locale = try {
-                        Locale.forLanguageTag(v.locale.ifBlank { "zh-CN" })
-                    } catch (_: Exception) {
-                        Locale.CHINA
-                    }
-                    // 特征：离线本地合成（无需网络）
-                    val features = setOf(TextToSpeech.Engine.KEY_FEATURE_EMBEDDED_SYNTHESIS)
-                    // 音色名带引擎前缀，便于系统 TTS 精确路由到对应引擎：
-                    //   "engineCode:shortName"（如 "sougou:yaxin"）
-                    // 也保留裸 shortName 作为无前缀回退（兼容外部 App 直接 setVoice("yaxin")）
-                    result.add(
-                        Voice(
-                            "${engine.code}:${v.shortName}",
-                            locale,
-                            Voice.QUALITY_HIGH,
-                            Voice.LATENCY_NORMAL,
-                            false,               // 不需网络连接
-                            features
-                        )
+        for (entry in voices) {
+            val locale = entry.locale.locale
+            // 特征：离线本地合成（无需网络）
+            val features = setOf(TextToSpeech.Engine.KEY_FEATURE_EMBEDDED_SYNTHESIS)
+            // 音色名带引擎前缀，便于系统 TTS 精确路由；仍保留现有裸 shortName 兼容入口。
+            result.add(
+                Voice(
+                    "${entry.engineCode}:${entry.shortName}",
+                    locale,
+                    Voice.QUALITY_HIGH,
+                    Voice.LATENCY_NORMAL,
+                    false,
+                    features
+                )
+            )
+            if (result.none { it.name == entry.shortName }) {
+                result.add(
+                    Voice(
+                        entry.shortName,
+                        locale,
+                        Voice.QUALITY_HIGH,
+                        Voice.LATENCY_NORMAL,
+                        false,
+                        features
                     )
-                    // 仅当 bare shortName 未被占用时补充裸名，避免歧义
-                    if (result.none { it.name == v.shortName }) {
-                        result.add(
-                            Voice(
-                                v.shortName,
-                                locale,
-                                Voice.QUALITY_HIGH,
-                                Voice.LATENCY_NORMAL,
-                                false,
-                                features
-                            )
-                        )
-                    }
-                }
-                MttsLog.d(TAG, "onGetVoices engine=${engine.code} count=${voices.size}")
-            } catch (e: Exception) {
-                MttsLog.e(TAG, "onGetVoices failed engine=${engine.code}", e)
+                )
             }
+        }
+        engines.forEach { engine ->
+            MttsLog.d(TAG, "onGetVoices engine=${engine.code} count=${voices.count { it.engineCode == engine.code }}")
         }
         MttsLog.d(TAG, "onGetVoices total=${result.size}")
         return result
     }
 
     override fun onGetFeaturesForLanguage(lang: String, country: String, variant: String): Set<String> =
-        setOf(TextToSpeech.Engine.KEY_FEATURE_EMBEDDED_SYNTHESIS)
+        if (TtsLocaleSupport.availability(lang, country, variant, availableLocales()) == TtsLanguageAvailability.UNSUPPORTED) {
+            emptySet()
+        } else {
+            setOf(TextToSpeech.Engine.KEY_FEATURE_EMBEDDED_SYNTHESIS)
+        }
+
+    private fun availableLocales(): List<TtsLocaleInfo> =
+        TtsVoiceInventory.actualVoices().map { it.locale }.distinctBy { it.id }
+
+    private fun TtsLanguageAvailability.toAndroidStatus(): Int = when (this) {
+        TtsLanguageAvailability.LANGUAGE -> TextToSpeech.LANG_AVAILABLE
+        TtsLanguageAvailability.COUNTRY -> TextToSpeech.LANG_COUNTRY_AVAILABLE
+        TtsLanguageAvailability.COUNTRY_VARIANT -> TextToSpeech.LANG_COUNTRY_VAR_AVAILABLE
+        TtsLanguageAvailability.UNSUPPORTED -> TextToSpeech.LANG_NOT_SUPPORTED
+    }
 
     /** 校验音色名是否有效（对齐 MultiTTS）：系统 setVoice/绑定音色时调用，缺失返回 -1 致音色无效 */
     override fun onIsValidVoiceName(voiceName: String): Int {
@@ -572,6 +628,13 @@ class TtsService : TextToSpeechService() {
             if (callback.start(24000, AudioFormat.ENCODING_PCM_16BIT, 1) == TextToSpeech.SUCCESS) callback.error()
             return
         }
+
+        // ★ 试听识别：系统试听链路 GET_SAMPLE_TEXT → speak()，外部 App 朗读永远不触发 GET_SAMPLE_TEXT。
+        //   GetSampleTextActivity 在 GET_SAMPLE_TEXT 时设 previewPending=true + 时间戳；
+        //   此处检查标志位（10 秒窗口内有效），精确区分试听 vs 外部朗读。
+        //   试听完成后系统不回调 onStop()，若不停 BGM 会延迟到 onDestroy 才停（实测 ~16s）。
+        val isPreview = GetSampleTextActivity.previewPending &&
+            (android.os.SystemClock.elapsedRealtime() - GetSampleTextActivity.previewTimestamp < 10_000L)
 
         // ★ BGM 复活修复：onStop/onDestroy 后外部 App 可能立刻又 speak()（翻页/续读）。
         //   翻页间隔通常 <1s，新朗读间隔 >2s。超过 2s 的重新 speak 视为新朗读，允许 BGM 重启。
@@ -626,6 +689,9 @@ class TtsService : TextToSpeechService() {
                 acquireLocks(myGen)
                 // ★ BGM：prepare 在后台队列线程做；代际失效时不会在 onStop 后迟到启动。
                 startBgmPlayer(myGen)
+                // ★ 新请求开始：取消上一请求留下的空闲定时器（避免上个请求完成时设置的
+                //   5s 定时器在本次请求合成中途触发，误停 BGM）；本次完成后会重新设置。
+                cancelBgmIdleTimer()
                 // ★ 延时路由 + 预处理全部移到工作线程（框架线程已立即返回，不再阻塞）
                 // ★ 外部参数自适应（用户规则：不猜语义，锚定基准后按相对变化跟随）
                 //   首条规则：无论外部初始参数是什么（200/0.5/100/…），首次收到的值 = 基准 1x，正常输出；
@@ -827,7 +893,15 @@ class TtsService : TextToSpeechService() {
                         com.mtts.app.util.TtsVoicesCache.get(segEngine).firstOrNull()?.shortName ?: finalVoice
                     }
                     val segSpeed = (finalSpeed * seg.speed).coerceIn(0.25f, 4f)
-                    val segVolume = (finalVolume * seg.volume * volMark).coerceIn(0f, 2f)
+                    // ★ 对话声音变小修复：每段音量基准用「该段实际音色」的 per-voice 音量配置，
+                    //   而非主音色的 finalVolume——角色音色自定义了音量会被主音色覆盖导致音量错乱。
+                    //   per-voice 未配置 → 全局音量 → config 自带（默认 1.0）
+                    val segVoiceVolume = AppPrefs.getVoiceVolume(segVoice)
+                        ?: AppPrefs.getGlobalVolume()
+                        ?: com.mtts.app.util.TtsVoicesCache.get(segEngine)
+                            .firstOrNull { it.shortName == segVoice }?.volume
+                        ?: 1f
+                    val segVolume = (segVoiceVolume * seg.volume * volMark).coerceIn(0f, 2f)
                     val segPitch = (finalPitch + seg.pitch + pitMark).coerceIn(-1f, 1f)
 
                     // 预先启动系统播放器以降低首字延迟；最终是否成功仍以语音 PCM 为准。
@@ -891,7 +965,9 @@ class TtsService : TextToSpeechService() {
                     var unifiedSeg = if (segRate == 24000) segPcm
                                      else PcmResampler.resample16BitMono(segPcm, segRate, 24000)
                     // ★ 峰值归一化音量均衡（在统一采样率后做）
-                    val balanced0 = PcmResampler.balanceVolume16BitMono(unifiedSeg, segVolume)
+                    //   maxGain 放宽到 8.0（+18dB）：多引擎对话时低基准声级引擎也能拉齐到
+                    //   18000 目标峰值，避免该角色声音明显小于满幅段落（对话声音变小主因）。
+                    val balanced0 = PcmResampler.balanceVolume16BitMono(unifiedSeg, segVolume, maxGain = 8.0f)
 
                                         // ★★ 音效混音（PCM 层）：BGM 已改为独立 MediaPlayer（见 startBgmPlayer），不再逐句 PCM 混入。
                     //   （原混入方案首段同步整首解码 44.1kHz BGM，卡输出线程 18 秒+ → 外部调用第一句"卡死"）
@@ -961,6 +1037,17 @@ class TtsService : TextToSpeechService() {
                         "dur=${totalBytes * 1000L / (24000 * 2L)}ms  voice=${engineForJob.code}:$finalVoice")
                 // 正常完成后 BGM 保持播放（外部朗读每句一次请求，跨句必须连续）；
                 // 由 onStop() 或异常/无语音路径（finally 的 bgmHadError）负责停止。
+                // ★ BGM 空闲自动停止兜底：每次请求完成都重置空闲定时器，
+                //   超过 BGM_IDLE_TIMEOUT_MS 仍无新请求 → 自动停 BGM。
+                //   覆盖三类场景：
+                //   ① 系统试听（GET_SAMPLE_TEXT 只触发一次，后续多次试听不再有标志位）→ 试听间隙/结束自动停
+                //   ② 外部阅读器停发请求但未调 onStop() → 不再无限播到 onDestroy
+                //   ③ onStop() 正常路径仍立即停（见 onStop），定时器只是兜底
+                if (isPreview) {
+                    MttsLog.d(TAG, "REQ #$reqNo 系统试听 → 重置空闲定时器（${BGM_IDLE_TIMEOUT_MS / 1000}s 后自动停）")
+                    GetSampleTextActivity.clearPreview()
+                }
+                restartBgmIdleTimer(myGen, isPreview)
                 callback.done()
             } catch (e: Exception) {
                 // ★ RejectedExecutionException（synthPool 已 terminated，onDestroy 后外部 App 仍在发请求）
@@ -995,6 +1082,7 @@ if (e is java.util.concurrent.RejectedExecutionException) {
             userStopped = true
             lastStopTime = android.os.SystemClock.elapsedRealtime()
             generation++
+            cancelBgmIdleTimer()
             stopBgmPlayer()
             releaseLocks()
             synthPool.shutdownNow()

@@ -759,16 +759,28 @@ abstractRoles.forEach { r ->
                     detectMsg = "未勾选任何角色（可点「全选」或勾选具体角色）"
                     return
                 }
-                val existing = characters.map { it.name }.toSet()
-                val newOnes = toAdd.filter { it.name.isNotBlank() && it.name !in existing }
+                // ★ 子串感知去重：已有「苍宫」+ 新识别「苍宫月」→ 视为同一人，不再重复添加。
+                //   规则：新名与任一已有角色名互为子串（长度差 ≥1，短名 ≥2 字，长名 ≤4 字）→ 跳过。
+                val existing = characters.map { it.name }.filter { it.isNotBlank() }
+                fun isDuplicate(newName: String): Boolean {
+                    if (existing.contains(newName)) return true
+                    return existing.any { e ->
+                        (e.length < newName.length && newName.length <= 4 && newName.contains(e) && e.length >= 2) ||
+                        (newName.length < e.length && e.length <= 4 && e.contains(newName) && newName.length >= 2)
+                    }
+                }
+                val newOnes = toAdd.filter { it.name.isNotBlank() && !isDuplicate(it.name) }
                     .map { DialogCharacter(name = it.name, group = it.gender, manual = false) }
+                val dupNames = toAdd.map { it.name }.filterNot { newOnes.any { n -> n.name == it } }
                 save(characters + newOnes)
                 // 清掉已添加的，保留未勾选的供再次选择
                 detected = detected.filterIndexed { i, _ -> i !in checkedIdx }
                 checkedIdx = detected.mapIndexedNotNull { i, d ->
                     if (d.count >= HIGH_FREQ_THRESHOLD) i else null
                 }.toSet()
-                detectMsg = "已加入 ${newOnes.size} 个角色，剩余 ${detected.size} 个未添加"
+                detectMsg = "已加入 ${newOnes.size} 个角色" +
+                    (if (dupNames.isNotEmpty()) "，跳过 ${dupNames.size} 个重复（${dupNames.joinToString("、")}）" else "") +
+                    "，剩余 ${detected.size} 个未添加"
                 return
             }
             // 首次点击：开始识别

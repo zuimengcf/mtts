@@ -39,6 +39,25 @@
             android:name="com.mtts.app.ui.TtsProbeActivity"
             android:exported="true" />
 
+        <activity
+            android:name="com.mtts.app.service.CheckTtsDataActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.speech.tts.engine.CHECK_TTS_DATA" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name="com.mtts.app.service.GetSampleTextActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.speech.tts.engine.GET_SAMPLE_TEXT" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
 
         <!-- 系统级 TTS 输出服务：任何 App 把默认 TTS 引擎切到 "mtts" 即可离线调用微软音色 -->
         <service

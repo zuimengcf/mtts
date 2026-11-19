@@ -121,4 +121,5 @@ dependencies {
     implementation("com.microsoft.cognitiveservices.speech:client-sdk-embedded:1.37.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+    testImplementation("junit:junit:4.13.2")
 }
